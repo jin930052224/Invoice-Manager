@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -6,6 +8,7 @@ from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.routers import health, invoices, settings as settings_router
 from app.routers import auth as auth_router
+from app.routers import dingtalk_import
 from app.rate_limit import limiter
 from app.auth import get_current_user
 
@@ -46,6 +49,7 @@ app.include_router(
     tags=["Invoices"],
     dependencies=[Depends(get_current_user)],
 )
+app.include_router(dingtalk_import.router, prefix="/api/dingtalk-import", tags=["DingTalk Import"], dependencies=[Depends(get_current_user)])
 app.include_router(
     settings_router.router,
     prefix="/api/settings",
@@ -67,6 +71,16 @@ async def startup():
         await conn.execute(text(
             "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS uploaded_by_id INTEGER REFERENCES users(id)"
         ))
+        await conn.execute(text(
+            "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS approval_instance_id VARCHAR(100)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS document_type VARCHAR(20) NOT NULL DEFAULT 'invoice'"
+        ))
+        await conn.execute(text("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS approval_claim_amount NUMERIC(12, 2)"))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_invoices_approval_instance_id ON invoices (approval_instance_id)"
+        ))
 
     # Seed default admin user if no users exist
     async with async_session_maker() as session:
@@ -80,6 +94,11 @@ async def startup():
             )
             session.add(admin)
             await session.commit()
+
+    # Recover uploads that were queued in memory when the backend last stopped.
+    # This task only queues durable UPLOADED/PROCESSING rows; parsing itself is
+    # concurrency-limited by the invoice router.
+    asyncio.create_task(invoices.resume_interrupted_processing())
 
 
 @app.get("/")

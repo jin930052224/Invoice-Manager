@@ -1,0 +1,3 @@
+.page { padding: 40px 48px; min-height: 100vh; background: var(--surface); }
+.heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+@media (max-width: 768px) { .page { padding: 20px 16px; } .heading { flex-wrap: wrap; } }

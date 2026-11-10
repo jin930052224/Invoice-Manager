@@ -1,5 +1,11 @@
 import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import CompanyPage from './pages/CompanyPage';
+import PersonPage from './pages/PersonPage';
+import ApprovalPage from './pages/ApprovalPage';
+import ApprovalInvoiceListPage from './pages/ApprovalInvoiceListPage';
+import VoucherArchivePage from './pages/VoucherArchivePage';
+import ReviewQueuePage from './pages/ReviewQueuePage';
 import UploadPage from './pages/UploadPage';
 import InvoiceListPage from './pages/InvoiceListPage';
 import InvoiceDetailPage from './pages/InvoiceDetailPage';
@@ -63,6 +69,12 @@ function AppContent() {
             >
               <Routes>
                 <Route path="/" element={<InvoiceListPage />} />
+                <Route path="/reviews" element={<ReviewQueuePage />} />
+                <Route path="/companies" element={<CompanyPage />} />
+                <Route path="/persons" element={<PersonPage />} />
+                <Route path="/approvals" element={<ApprovalPage />} />
+                <Route path="/approvals/:approvalNumber/invoices" element={<ApprovalInvoiceListPage />} />
+                <Route path="/vouchers" element={<VoucherArchivePage />} />
                 <Route path="/upload" element={<UploadPage />} />
                 <Route path="/invoices/:id" element={<InvoiceDetailPage />} />
                 <Route path="/admin/users" element={<UserManagePage />} />

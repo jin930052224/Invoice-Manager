@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Card,
   Table,
@@ -15,6 +15,7 @@ import {
   Row,
   Col,
   Empty,
+  Alert,
 } from 'antd';
 import {
   EyeOutlined,
@@ -28,7 +29,8 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
-import { listInvoices, deleteInvoice, batchUpdateInvoices, batchDeleteInvoices, batchReprocessInvoices, batchConfirmInvoices, getStatistics, checkDuplicates, downloadInvoiceExport } from '../services/api';
+import { listInvoices, listCompanies, deleteInvoice, batchUpdateInvoices, batchDeleteInvoices, batchReprocessInvoices, batchUnlockInvoices, batchSyncInvoices, batchConfirmInvoices, getStatistics, checkDuplicates, downloadInvoiceExport, startDingTalkApprovalImport, getDingTalkApprovalImportStatus, getParsingStatus } from '../services/api';
+import type { CompanyGroup, ParsingStatus } from '../services/api';
 import type { Invoice, Statistics, DuplicateGroup } from '../types/invoice';
 import { InvoiceStatus } from '../types/invoice';
 import ResizableTitle from '../components/ResizableTitle';
@@ -52,21 +54,35 @@ const statusColors: Record<string, string> = {
 };
 
 function InvoiceListPage() {
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
+  const approvalNumber = searchParams.get('approval_number');
   const navigate = useNavigate();
   const { user: currentUser } = useAuth();
   const [loading, setLoading] = useState(false);
+
+  // Old approval links used the root invoice list with a query parameter.
+  // Move them into the dedicated approval module so the main list keeps its
+  // own navigation history and filters.
+  useEffect(() => {
+    if (approvalNumber) {
+      navigate(`/approvals/${encodeURIComponent(approvalNumber)}/invoices`, { replace: true });
+    }
+  }, [approvalNumber, navigate]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
   const [statistics, setStatistics] = useState<Statistics | null>(null);
+  const [syncLoading, setSyncLoading] = useState(false);
 
   // Duplicate check state
   const [dupLoading, setDupLoading] = useState(false);
   const [dupModalOpen, setDupModalOpen] = useState(false);
   const [dupGroups, setDupGroups] = useState<DuplicateGroup[]>([]);
   const [dupSummary, setDupSummary] = useState({ total_groups: 0, total_duplicates: 0 });
+  const [duplicateDeletingId, setDuplicateDeletingId] = useState<number | null>(null);
 
   const handleCheckDuplicates = async () => {
     setDupLoading(true);
@@ -82,11 +98,48 @@ function InvoiceListPage() {
     }
   };
 
+  const approvalNumbersOf = (group: DuplicateGroup) =>
+    Array.from(
+      new Set(group.invoices.map((invoice) => invoice.approval_instance_id).filter(Boolean)),
+    ) as string[];
+
+  const handleDeleteDuplicate = async (invoice: Invoice) => {
+    setDuplicateDeletingId(invoice.id);
+    try {
+      await deleteInvoice(invoice.id);
+      message.success(`已删除发票 ID ${invoice.id}`);
+      await Promise.all([handleCheckDuplicates(), fetchInvoices()]);
+    } catch {
+      message.error('删除发票失败');
+    } finally {
+      setDuplicateDeletingId(null);
+    }
+  };
+
   // Filters
   const [statusFilter, setStatusFilter] = useState<string | undefined>();
   const [ownerFilter, setOwnerFilter] = useState<string>('');
   const [dateRange, setDateRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>(null);
   const [searchValue, setSearchValue] = useState<string>('');
+  const [partyTypeFilter, setPartyTypeFilter] = useState<'company' | 'person' | undefined>();
+  const [partyKeyFilter, setPartyKeyFilter] = useState<string | undefined>();
+  const [personBuyerSearch, setPersonBuyerSearch] = useState('');
+  const [companyGroups, setCompanyGroups] = useState<CompanyGroup[]>([]);
+  const [approvalImport, setApprovalImport] = useState<any>(null);
+  const [parsingStatus, setParsingStatus] = useState<ParsingStatus | null>(null);
+
+  useEffect(() => {
+    listCompanies()
+      .then(companies => setCompanyGroups(companies.items))
+      .catch(() => message.error('公司分类加载失败'));
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => getParsingStatus().then(setParsingStatus).catch(() => {});
+    refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // Column settings
   const {
@@ -101,11 +154,15 @@ function InvoiceListPage() {
     setLoading(true);
     try {
       const params: Record<string, unknown> = { page, page_size: pageSize };
+      if (approvalNumber) params.approval_number = approvalNumber;
       if (statusFilter) params.status = statusFilter;
       if (ownerFilter) params.owner = ownerFilter;
       if (dateRange?.[0]) params.start_date = dateRange[0].format('YYYY-MM-DD');
       if (dateRange?.[1]) params.end_date = dateRange[1].format('YYYY-MM-DD');
       if (searchValue) params.keyword = searchValue;
+      if (partyTypeFilter) params.party_type = partyTypeFilter;
+      if (partyKeyFilter) params.company_key = partyKeyFilter;
+      if (partyTypeFilter === 'person' && personBuyerSearch.trim()) params.buyer_keyword = personBuyerSearch.trim();
 
       const response = await listInvoices(params);
       setInvoices(response.items);
@@ -138,7 +195,7 @@ function InvoiceListPage() {
 
   useEffect(() => {
     fetchInvoices();
-  }, [page, pageSize, statusFilter, ownerFilter, dateRange, searchValue]);
+  }, [page, pageSize, statusFilter, ownerFilter, dateRange, searchValue, partyTypeFilter, partyKeyFilter, personBuyerSearch]);
 
   // Auto-poll while any invoice is in processing state
   useEffect(() => {
@@ -171,6 +228,18 @@ function InvoiceListPage() {
 
   const handleOwnerChange = (value: string) => {
     setOwnerFilter(value);
+    setPage(1);
+  };
+
+  const handlePartyTypeChange = (value: 'company' | 'person' | undefined) => {
+    setPartyTypeFilter(value);
+    setPartyKeyFilter(undefined);
+    setPersonBuyerSearch('');
+    setPage(1);
+  };
+
+  const handlePartyKeyChange = (value: string | undefined) => {
+    setPartyKeyFilter(value);
     setPage(1);
   };
 
@@ -233,7 +302,7 @@ function InvoiceListPage() {
 
     Modal.confirm({
       title: '确认重新解析',
-      content: `确定要重新解析选中的 ${selectedRowKeys.length} 张发票吗？旧的解析结果将被清除。`,
+      content: `确定要重新解析选中的 ${selectedRowKeys.length} 张发票吗？成功后更新解析结果，失败时保留原有数据。`,
       okText: '确认重新解析',
       cancelText: '取消',
       onOk: async () => {
@@ -242,8 +311,27 @@ function InvoiceListPage() {
           message.success(result.message);
           setSelectedRowKeys([]);
           fetchInvoices();
-        } catch (error) {
-          message.error('批量重新解析失败');
+        } catch (error: any) {
+          message.error(error?.response?.data?.detail || '批量重新解析失败');
+        }
+      },
+    });
+  };
+
+  const handleBatchUnlock = () => {
+    Modal.confirm({
+      title: '批量取消锁定',
+      content: `将选中的 ${selectedRowKeys.length} 张发票中已确认锁定的记录改为待审核，之后可以编辑或重新解析。未锁定的记录会跳过。`,
+      okText: '取消锁定',
+      cancelText: '返回',
+      onOk: async () => {
+        try {
+          const result = await batchUnlockInvoices(selectedRowKeys);
+          message.success(result.message);
+          setSelectedRowKeys([]);
+          fetchInvoices();
+        } catch (error: any) {
+          message.error(error?.response?.data?.detail || '批量取消锁定失败');
         }
       },
     });
@@ -294,9 +382,50 @@ function InvoiceListPage() {
     if (dateRange?.[1]) {
       params.append('end_date', dateRange[1].format('YYYY-MM-DD'));
     }
+    if (partyKeyFilter) {
+      params.append('company_key', partyKeyFilter);
+    }
+    if (partyTypeFilter) {
+      params.append('party_type', partyTypeFilter);
+    }
+    if (partyTypeFilter === 'person' && personBuyerSearch.trim()) {
+      params.append('buyer_keyword', personBuyerSearch.trim());
+    }
+    if (searchValue) {
+      params.append('keyword', searchValue);
+    }
 
     downloadInvoiceExport(format, params).catch(() => message.error('导出失败'));
   };
+
+  const handleDingTalkSync = async () => {
+    const params: Record<string, string> = {};
+    if (selectedRowKeys.length > 0) params.invoice_ids = selectedRowKeys.join(',');
+    if (statusFilter) params.status = statusFilter;
+    if (ownerFilter) params.owner = ownerFilter;
+    if (dateRange?.[0]) params.start_date = dateRange[0].format('YYYY-MM-DD');
+    if (dateRange?.[1]) params.end_date = dateRange[1].format('YYYY-MM-DD');
+    if (searchValue) params.keyword = searchValue;
+    if (partyTypeFilter) params.party_type = partyTypeFilter;
+    if (partyKeyFilter) params.company_key = partyKeyFilter;
+    if (partyTypeFilter === 'person' && personBuyerSearch.trim()) {
+      params.buyer_keyword = personBuyerSearch.trim();
+    }
+    setSyncLoading(true);
+    try {
+      const result = await batchSyncInvoices(params);
+      message.success(result.message);
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '提交钉钉同步失败');
+    } finally {
+      setSyncLoading(false);
+    }
+  };
+
+  const handleApprovalAttachmentUpload = () => {
+    startDingTalkApprovalImport().then(setApprovalImport).then(() => message.success('审批流程附件导入任务已提交')).catch(() => message.error('提交导入任务失败'));
+  };
+  useEffect(() => { const t=window.setInterval(()=>getDingTalkApprovalImportStatus().then(setApprovalImport).catch(()=>{}), 3000); getDingTalkApprovalImportStatus().then(setApprovalImport).catch(()=>{}); return ()=>window.clearInterval(t); }, []);
 
   // All column definitions
   const allColumnDefinitions: Record<string, ColumnsType<Invoice>[number]> = useMemo(
@@ -311,6 +440,18 @@ function InvoiceListPage() {
         onHeaderCell: () => ({
           width: columnWidths.invoice_number,
           onResize: handleColumnResize('invoice_number'),
+        }),
+      },
+      approval_instance_id: {
+        title: '审批编号',
+        dataIndex: 'approval_instance_id',
+        key: 'approval_instance_id',
+        width: columnWidths.approval_instance_id,
+        ellipsis: true,
+        render: (val) => val || '-',
+        onHeaderCell: () => ({
+          width: columnWidths.approval_instance_id,
+          onResize: handleColumnResize('approval_instance_id'),
         }),
       },
       issue_date: {
@@ -559,7 +700,7 @@ function InvoiceListPage() {
             <Button
               type="link"
               icon={<EyeOutlined />}
-            onClick={() => navigate(`/invoices/${record.id}`, { state: { ids: invoices.map((i) => i.id) } })}
+            onClick={() => navigate(`/invoices/${record.id}`, { state: { ids: invoices.map((i) => i.id), returnTo: `${location.pathname}${location.search}`, returnLabel: approvalNumber ? '返回审批发票' : '返回列表' } })}
             >
               详情
             </Button>
@@ -645,6 +786,27 @@ function InvoiceListPage() {
             导出
           </Button>
           <Button
+            onClick={() => navigate('/vouchers')}
+            className={styles.secondaryButton}
+          >
+            凭证归档
+          </Button>
+          <Button
+            icon={<SyncOutlined />}
+            onClick={handleDingTalkSync}
+            loading={syncLoading}
+            className={styles.secondaryButton}
+          >
+            同步钉钉
+          </Button>
+          <Button
+            icon={<UploadOutlined />}
+            onClick={handleApprovalAttachmentUpload}
+            className={styles.secondaryButton}
+          >
+            审批流程附件上传
+          </Button>
+          <Button
             type="primary"
             icon={<UploadOutlined />}
             onClick={() => navigate('/upload')}
@@ -655,11 +817,21 @@ function InvoiceListPage() {
         </div>
       </div>
 
+      {approvalImport && <div style={{ marginBottom: 12, color: approvalImport.failed ? '#cf1322' : '#666' }}>审批附件导入：{approvalImport.failed ? '部分附件导入失败' : approvalImport.status} · 扫描进度 {approvalImport.windows_completed ?? 0}/{approvalImport.windows_total ?? 0} 个时间段 · 已扫描审批 {approvalImport.scanned_approvals ?? 0} 笔 · 总附件 {approvalImport.total} · 已下载 {approvalImport.downloaded} · 已识别 {approvalImport.recognized} · 发票 {approvalImport.invoices} · 非发票 {approvalImport.non_invoices} · 跳过 {approvalImport.skipped} · 失败 {approvalImport.failed}</div>}
+      {parsingStatus && parsingStatus.pending > 0 && (
+        <Alert
+          showIcon
+          type="info"
+          style={{ marginBottom: 12 }}
+          message={`正在解析：${parsingStatus.processing} 张处理中，${parsingStatus.queued} 张排队`}
+          description={`没有发票字段的附件会自动归档到凭证备份；当前已归档 ${parsingStatus.archived_vouchers} 份。进度每 5 秒刷新。`}
+        />
+      )}
       {/* Metric Cards */}
       <div className={styles.metricsSection}>
         <MetricCard
-          label="发票数量"
-          value={pageStatistics.count}
+          label={approvalNumber ? '当前筛选发票数' : '发票总数'}
+          value={total}
         />
         <MetricCard
           label="金额合计"
@@ -728,6 +900,44 @@ function InvoiceListPage() {
 
       {/* Additional Controls */}
       <div className={styles.additionalControls}>
+        <Select
+          allowClear
+          placeholder="筛选公司或个人"
+          style={{ width: 160 }}
+          value={partyTypeFilter}
+          onChange={handlePartyTypeChange}
+          options={[
+            { label: '公司', value: 'company' },
+            { label: '个人', value: 'person' },
+          ]}
+        />
+
+        {partyTypeFilter === 'company' && (
+          <Select
+            showSearch
+            allowClear
+            optionFilterProp="label"
+            placeholder="选择具体公司"
+            style={{ width: 240 }}
+            value={partyKeyFilter}
+            onChange={handlePartyKeyChange}
+            options={companyGroups.map(group => ({
+              value: group.key,
+              label: group.name || group.tax_id || '未归类公司',
+            }))}
+          />
+        )}
+
+        {partyTypeFilter === 'person' && (
+          <Input
+            allowClear
+            placeholder="搜索购买方（可选）"
+            style={{ width: 200 }}
+            value={personBuyerSearch}
+            onChange={event => { setPersonBuyerSearch(event.target.value); setPage(1); }}
+          />
+        )}
+
         <Input
           placeholder="归属人"
           style={{ width: 120 }}
@@ -759,6 +969,9 @@ function InvoiceListPage() {
               onClick={handleBatchReprocess}
             >
               重新解析
+            </Button>
+            <Button onClick={handleBatchUnlock}>
+              批量取消锁定
             </Button>
             <Button
               icon={<CheckOutlined />}
@@ -875,41 +1088,87 @@ function InvoiceListPage() {
       >
         {dupGroups.length === 0 ? (
           <div style={{ textAlign: 'center', padding: '40px 0', color: '#52c41a', fontSize: 16 }}>
-            ✓ 未发现重复发票
+            ✓ 未发现跨审批单重复发票
           </div>
         ) : (
-          dupGroups.map((group, idx) => (
+          <>
+            <div style={{
+              background: '#fafafa',
+              border: '1px solid #f0f0f0',
+              borderRadius: 6,
+              padding: '8px 14px',
+              marginBottom: 16,
+              fontSize: 12,
+              color: '#595959',
+              lineHeight: 1.9,
+            }}>
+              共 <b>{dupSummary.total_groups}</b> 组 / <b>{dupSummary.total_duplicates}</b> 张。
+              查重只显示<b>同发票号码、不同审批编号</b>的记录。同一审批编号下的重复上传不计入这里。
+              {dupGroups.some((g) => approvalNumbersOf(g).length > 1) && (
+                <span style={{ color: '#ff4d4f' }}>
+                  其中跨审批单重复 {dupGroups.filter((g) => approvalNumbersOf(g).length > 1).length} 组，属于疑似重复报销证据，系统禁止删除任何一条。
+                </span>
+              )}
+            </div>
+            {dupGroups.map((group, idx) => {
+            const approvalList = approvalNumbersOf(group);
+            const crossApproval = approvalList.length > 1;
+            const hasManualCopy = group.invoices.some((i) => !i.approval_instance_id);
+            return (
             <div key={idx} style={{ marginBottom: 24 }}>
               <div style={{
-                background: '#fff7e6',
-                border: '1px solid #ffd591',
+                background: crossApproval ? '#fff1f0' : '#fff7e6',
+                border: `1px solid ${crossApproval ? '#ffa39e' : '#ffd591'}`,
                 borderRadius: 6,
                 padding: '8px 14px',
                 marginBottom: 8,
                 display: 'flex',
                 alignItems: 'center',
+                flexWrap: 'wrap',
                 gap: 12,
               }}>
                 <Tag color="warning">{group.reason}</Tag>
                 <span style={{ fontSize: 13, color: '#595959', wordBreak: 'break-all' }}>
                   {group.duplicate_key}
                 </span>
+                <span style={{
+                  fontSize: 12,
+                  color: crossApproval ? '#ff4d4f' : '#8c8c8c',
+                  fontWeight: crossApproval ? 600 : 400,
+                }}>
+                  涉及审批单：
+                  {approvalList.length ? approvalList.join('、') : '（均无审批单）'}
+                  {crossApproval ? `（${approvalList.length} 个，跨审批单重复）` : ''}
+                  {hasManualCopy ? '　含手动上传副本（无审批单）' : ''}
+                </span>
                 <span style={{ marginLeft: 'auto', fontSize: 12, color: '#8c8c8c' }}>
                   {group.invoices.length} 张
                 </span>
+                {crossApproval && (
+                  <Tag color="error">疑似重复报销证据，禁止删除</Tag>
+                )}
               </div>
               <Table
                 size="small"
                 rowKey="id"
                 dataSource={group.invoices}
                 pagination={false}
-                scroll={{ x: 800 }}
+                scroll={{ x: 1010 }}
                 columns={[
-                  { title: 'ID', dataIndex: 'id', width: 60 },
+                  { title: 'ID', dataIndex: 'id', width: 70 },
                   { title: '发票号码', dataIndex: 'invoice_number', width: 140, render: (v) => v || '-' },
-                  { title: '开票日期', dataIndex: 'issue_date', width: 100, render: (v) => v || '-' },
-                  { title: '销售方', dataIndex: 'seller_name', width: 160, ellipsis: true, render: (v) => v || '-' },
-                  { title: '购买方', dataIndex: 'buyer_name', width: 160, ellipsis: true, render: (v) => v || '-' },
+                  {
+                    // 查重是按全库比对的，重的那两张可能来自完全不同的审批单，
+                    // 不显示审批单号就分不清该找谁核对、哪一笔该删。
+                    title: '审批单号',
+                    dataIndex: 'approval_instance_id',
+                    width: 180,
+                    render: (v: string | null) =>
+                      v
+                        ? <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{v}</span>
+                        : <Tag>手动上传</Tag>,
+                  },
+                  { title: '归属人', dataIndex: 'owner', width: 90, render: (v) => v || '-' },
                   {
                     title: '价税合计',
                     dataIndex: 'total_with_tax',
@@ -920,23 +1179,49 @@ function InvoiceListPage() {
                   { title: '状态', dataIndex: 'status', width: 80, render: (v) => <Tag color={statusColors[v] || 'default'}>{v}</Tag> },
                   {
                     title: '操作',
-                    width: 70,
+                    width: 130,
                     fixed: 'right' as const,
                     render: (_, record) => (
-                      <Button
-                        type="link"
-                        size="small"
-                        icon={<EyeOutlined />}
-                        onClick={() => { setDupModalOpen(false); navigate(`/invoices/${record.id}`); }}
-                      >
-                        详情
-                      </Button>
+                      <Space size={0}>
+                        <Button
+                          type="link"
+                          size="small"
+                          icon={<EyeOutlined />}
+                          onClick={() => { setDupModalOpen(false); navigate(`/invoices/${record.id}`); }}
+                        >
+                          详情
+                        </Button>
+                        {crossApproval ? (
+                          <Tag color="red">保留证据</Tag>
+                        ) : (
+                          <Popconfirm
+                            title={`确认删除发票 ID ${record.id}？`}
+                            description="只删除当前这一张记录，其他同发票号记录不受影响。"
+                            okText="删除"
+                            cancelText="取消"
+                            okButtonProps={{ danger: true }}
+                            onConfirm={() => handleDeleteDuplicate(record)}
+                          >
+                            <Button
+                              type="link"
+                              danger
+                              size="small"
+                              icon={<DeleteOutlined />}
+                              loading={duplicateDeletingId === record.id}
+                            >
+                              删除
+                            </Button>
+                          </Popconfirm>
+                        )}
+                      </Space>
                     ),
                   },
                 ]}
               />
             </div>
-          ))
+            );
+          })}
+          </>
         )}
       </Modal>
     </div>

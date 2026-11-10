@@ -58,6 +58,9 @@ class Invoice(Base):
     # Status management
     status = Column(SQLEnum(InvoiceStatus), default=InvoiceStatus.PENDING, nullable=False)
     owner = Column(String(100), nullable=True)  # 归属人
+    approval_instance_id = Column(String(100), nullable=True, index=True)  # 钉钉审批单号
+    approval_claim_amount = Column(Numeric(12, 2), nullable=True)  # 审批明细申报金额
+    document_type = Column(String(20), nullable=False, default="invoice")
 
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

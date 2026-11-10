@@ -59,3 +59,70 @@ def test_llm_response_invalid_fields_to_none():
     assert fields["amount"] is None
     assert fields["tax_amount"] is None
     assert fields["tax_rate"] is None
+
+
+def test_configured_gemini_gateway_alias_supports_vision(monkeypatch):
+    from app.services import llm_service
+    monkeypatch.setattr(llm_service.settings, "openai_model", "gemini-3.8-flash-high")
+    assert llm_service.OpenAIProvider().supports_vision()
+    monkeypatch.setattr(llm_service.settings, "openai_model", "unknown-text-model")
+    assert not llm_service.OpenAIProvider().supports_vision()
+
+
+def test_deepseek_vision_falls_back_to_gemini_on_error(monkeypatch):
+    from app.services import llm_service
+    monkeypatch.setattr(llm_service.settings, "openai_model", "mf-deepseek-v4.1-flash")
+    monkeypatch.setattr(llm_service.settings, "openai_fallback_model", "gemini-3.8-flash-high")
+    assert llm_service.OpenAIProvider().supports_vision()
+    calls = []
+
+    def fake_vision(self, system, prompt, image, mime, model=None):
+        calls.append(model or llm_service.settings.openai_model)
+        if model is None:
+            raise RuntimeError("primary unavailable")
+        return json.dumps({"invoice_number": "26332000006693679501", "total_with_tax": "100.00"})
+
+    monkeypatch.setattr(llm_service.OpenAIProvider, "vision_completion", fake_vision)
+    service = LLMService()
+    monkeypatch.setattr(type(service), "active_provider", property(lambda self: llm_service.OpenAIProvider()))
+    fields = service.parse_invoice_from_image(b"image")
+    assert fields["invoice_number"] == "26332000006693679501"
+    assert calls == ["mf-deepseek-v4.1-flash", "gemini-3.8-flash-high"]
+
+
+def test_pdf_text_parser_uses_chat_completion(monkeypatch):
+    service = LLMService()
+    provider = type("Provider", (), {
+        "chat_completion": lambda self, system, prompt: json.dumps({
+            "invoice_number": "26332000006693679501",
+            "issue_date": "2026-08-03",
+            "buyer_name": "杭州气泽科技有限公司",
+            "seller_name": "东冠集团有限公司",
+            "total_with_tax": "100.00",
+        }),
+        "get_provider_name": lambda self: "test",
+    })()
+    monkeypatch.setattr(type(service), "is_available", property(lambda self: True))
+    monkeypatch.setattr(type(service), "active_provider", property(lambda self: provider))
+
+    fields = service.parse_invoice_from_text(
+        "发票号码：26332000006693679501\n销售方名称：东冠集团有限公司"
+    )
+
+    assert fields["invoice_number"] == "26332000006693679501"
+    assert fields["seller_name"] == "东冠集团有限公司"
+    assert fields["total_with_tax"] == "100.00"
+
+
+def test_seller_tax_id_is_not_copied_to_individual_buyer():
+    content = json.dumps({
+        "buyer_name": "钟燕红",
+        "buyer_tax_id": "91330108MAK7FH0AXT",
+        "seller_name": "杭州一王科技有限公司",
+        "seller_tax_id": "91330108MAK7FH0AXT",
+    })
+
+    fields = LLMService()._parse_json_response(content, "test")
+
+    assert fields["buyer_tax_id"] is None
+    assert fields["seller_tax_id"] == "91330108MAK7FH0AXT"

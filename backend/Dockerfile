@@ -2,9 +2,10 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies for PaddleOCR with retry
-RUN for i in 1 2 3 4 5; do \
-    apt-get update && apt-get install -y --no-install-recommends \
+# Use a nearby Debian mirror; these packages are needed by PaddleOCR and PDF parsing.
+RUN sed -i 's@deb.debian.org/debian@mirrors.aliyun.com/debian@g; s@deb.debian.org/debian-security@mirrors.aliyun.com/debian-security@g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         libgomp1 \
         libglib2.0-0 \
         libgl1 \
@@ -12,9 +13,7 @@ RUN for i in 1 2 3 4 5; do \
         libxext6 \
         libxrender1 \
         poppler-utils \
-    && rm -rf /var/lib/apt/lists/* \
-    && break || sleep 15; \
-    done
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .

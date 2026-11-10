@@ -4,6 +4,7 @@ services:
   db:
     image: postgres:16-alpine
     container_name: invoice_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -23,26 +24,47 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: invoice_backend
+    restart: unless-stopped
     env_file:
       - ./backend/.env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/invoice_db
       DEBUG: "true"
+      # 2026-09-22：同步目标从 AI 表格 hERWDMS 换成钉钉在线表格《报销统计表》(axls)。
+      # 旧的「每张发票 → AI 表格」同步**已停用**（置 false）。
+      # 新链路不在后端：由 scripts/dingtalk_approval_import_worker.py 按审批单入队，
+      # scripts/dingtalk_sync_worker.py 块写表格。见 dingtalk_reimbursement_mapper.py。
+      #
+      # 🔴 DINGTALK_BASE_ID / DINGTALK_TABLE_ID 下面这两个值指向的是**已停用的旧表**
+      #    （AI 表格 hERWDMS，2026-09-22 10:24 后再无写入，现存 242 条历史记录）。
+      #    **DINGTALK_SYNC_ENABLED 必须保持 "false"** —— 一旦打开，后端就会拿这两个 ID
+      #    往**废弃的旧表**里写发票，而不是写《报销统计表》。
+      #    新表是 axls 在线电子表格（nodeId 4lgGw3P8vPbXxd01hZpympmRV5daZ90D /
+      #    sheetId kgqie6hm），后端这套 aitable 代码**根本不支持**，别指望改 ID 就能切过去。
+      #    真要启用后端直写，得先按 axls 的 `dws sheet` API 重写 dingtalk_sync_service.py。
+      DINGTALK_SYNC_ENABLED: "false"
+      # ⚠️ 仅作历史参照，不是当前生效目标
+      DINGTALK_BASE_ID: LeBq413JA24E9bjoHzYPeEZg8DOnGvpb
+      DINGTALK_TABLE_ID: hERWDMS
+      DINGTALK_SYNC_QUEUE_DIR: /dingtalk-sync-queue
     volumes:
       - ./backend:/app
       - paddleocr_models:/root/.paddleocr
+      - /Volumes/D 盘/Codex/发票管理系统/dingtalk-sync-queue:/dingtalk-sync-queue
+      - /Volumes/D 盘/Codex/发票管理系统/dingtalk-import-queue:/dingtalk-import-queue
     ports:
       - "18841:18080"
     depends_on:
       db:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 18080 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 18080
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: invoice_frontend
+    restart: unless-stopped
     volumes:
       - ./frontend:/app
       - /app/node_modules

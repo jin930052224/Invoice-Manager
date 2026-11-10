@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    openai_fallback_model: str = ""
     openai_base_url: str = ""  # Custom base URL (for OpenAI-compatible APIs)
 
     # Anthropic (Claude)
@@ -46,10 +47,9 @@ class Settings(BaseSettings):
     allowed_extensions: list[str] = ["pdf", "jpg", "jpeg", "png"]
 
     # Parallel processing settings
-    # Separate pools for OCR and LLM to maximize throughput
-    # OCR is CPU-bound (image processing), limit based on available cores
-    # LLM is I/O-bound (API calls), can handle more concurrent requests
-    ocr_max_workers: int = 8   # CPU-bound: ~2x typical core count
+    # PaddleOCR's native predictor must only process one file at a time; LLM
+    # network requests can still run concurrently.
+    ocr_max_workers: int = 1
     llm_max_workers: int = 15  # I/O-bound: limited by API rate limits
 
     # App
@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # Auth
     jwt_secret_key: str = "invoice-manager-secret-please-change-in-production"
     jwt_expire_hours: int = 24 * 7  # 7 days
+
+    # DingTalk AI Table synchronization
+    dingtalk_sync_enabled: bool = False
+    dingtalk_base_id: str = ""
+    dingtalk_table_id: str = ""
+    dingtalk_sync_queue_dir: str = "/dingtalk-sync-queue"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

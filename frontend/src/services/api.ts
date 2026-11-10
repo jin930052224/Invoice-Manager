@@ -100,7 +100,7 @@ export const healthCheck = async () => {
 };
 
 // Upload invoices
-export const uploadInvoices = async (files: File[], processingMode: string = 'ocr_and_llm'): Promise<UploadResponse[]> => {
+export const uploadInvoices = async (files: File[], processingMode: string = 'llm_only'): Promise<UploadResponse[]> => {
   const formData = new FormData();
   files.forEach((file) => {
     formData.append('files', file);
@@ -117,16 +117,34 @@ export const uploadInvoices = async (files: File[], processingMode: string = 'oc
 
 // List invoices
 export interface ListParams {
+  company_key?: string;
+  party_type?: 'company' | 'person';
+  buyer_keyword?: string;
   page?: number;
   page_size?: number;
   status?: string;
   owner?: string;
   start_date?: string;
   end_date?: string;
+  approval_number?: string;
 }
 
 export const listInvoices = async (params: ListParams = {}): Promise<InvoiceListResponse> => {
   const response = await api.get('/invoices', { params });
+  return response.data;
+};
+
+export interface ParsingStatus {
+  queued: number;
+  processing: number;
+  pending: number;
+  reviewing: number;
+  confirmed: number;
+  archived_vouchers: number;
+}
+
+export const getParsingStatus = async (): Promise<ParsingStatus> => {
+  const response = await api.get('/invoices/processing-status');
   return response.data;
 };
 
@@ -162,13 +180,17 @@ export const downloadBlobUrl = (url: string, filename: string): void => {
 };
 
 // Export invoices (CSV / Excel) via axios so auth header is sent
-export const downloadInvoiceExport = async (format: 'csv' | 'excel', params: URLSearchParams): Promise<void> => {
+export const downloadInvoiceExport = async (
+  format: 'csv' | 'excel',
+  params: URLSearchParams,
+  filename?: string,
+): Promise<void> => {
   const response = await api.get(`/invoices/export/${format}?${params.toString()}`, { responseType: 'blob' });
   const ext = format === 'csv' ? 'csv' : 'xlsx';
   const url = URL.createObjectURL(response.data as Blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `invoices.${ext}`;
+  a.download = filename || `invoices.${ext}`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -256,6 +278,11 @@ export const confirmInvoice = async (
   return response.data;
 };
 
+export const unlockInvoice = async (invoiceId: number): Promise<{ message: string }> => {
+  const response = await api.post(`/invoices/${invoiceId}/unlock`);
+  return response.data;
+};
+
 // Batch confirm invoices
 export const batchConfirmInvoices = async (
   invoiceIds: number[]
@@ -271,6 +298,22 @@ export const batchConfirmInvoices = async (
   return { success, failed, errors };
 };
 
+export const archiveInvoiceAsVoucher = async (
+  invoiceId: number,
+): Promise<{ message: string }> => {
+  const response = await api.post(`/invoices/${invoiceId}/archive-voucher`);
+  return response.data;
+};
+
+export const batchArchiveVouchers = async (
+  invoiceIds: number[],
+): Promise<{ message: string; archived_count: number }> => {
+  const response = await api.post('/invoices/batch-archive-vouchers', {
+    invoice_ids: invoiceIds,
+  });
+  return response.data;
+};
+
 // Re-process invoice (run OCR/LLM again)
 export const reprocessInvoice = async (
   invoiceId: number
@@ -279,13 +322,27 @@ export const reprocessInvoice = async (
   return response.data;
 };
 
-// Batch reprocess invoices (clear old results and re-run OCR/LLM)
+// Batch reprocess invoices (keep old results until replacement succeeds)
 export const batchReprocessInvoices = async (
   invoiceIds: number[]
 ): Promise<{ message: string; count: number }> => {
   const response = await api.post('/invoices/batch-reprocess', {
     invoice_ids: invoiceIds,
   });
+  return response.data;
+};
+
+export const batchUnlockInvoices = async (
+  invoiceIds: number[]
+): Promise<{ message: string; unlocked: number; skipped: number }> => {
+  const response = await api.post('/invoices/batch-unlock', { invoice_ids: invoiceIds });
+  return response.data;
+};
+
+export const batchSyncInvoices = async (
+  params: Record<string, string>
+): Promise<{ message: string; count: number }> => {
+  const response = await api.post('/invoices/batch-sync', null, { params });
   return response.data;
 };
 
@@ -345,3 +402,33 @@ export const getAvailableModels = async (
 };
 
 export default api;
+
+export interface CompanyGroup {
+  key: string;
+  name: string | null;
+  tax_id: string | null;
+  invoice_count: number;
+  total_amount: string;
+  missing_amount_count: number;
+  review_count: number;
+}
+export const listCompanies = async (): Promise<{ items: CompanyGroup[] }> => {
+  return (await api.get('/invoices/companies')).data;
+};
+
+export interface PersonGroup {
+  key: string;
+  name: string;
+  invoice_count: number;
+  total_amount: string;
+  missing_amount_count: number;
+  review_count: number;
+}
+export const listPersons = async (): Promise<{ items: PersonGroup[] }> => {
+  return (await api.get('/invoices/persons')).data;
+};
+export const startDingTalkApprovalImport = async () => (await api.post('/dingtalk-import/run')).data;
+export const startDingTalkApprovalNumberImport = async (approvalNumber: string) => (await api.post('/dingtalk-import/run-approval', { approval_number: approvalNumber })).data;
+export const getDingTalkApprovalImportStatus = async () => (await api.get('/dingtalk-import/status')).data;
+export const listDingTalkApprovals = async (): Promise<{ items: Array<{ approval_number: string; owner?: string; status?: string; submitted_at?: string | null }> }> => (await api.get('/dingtalk-import/approvals')).data;
+export const listVouchers = async (): Promise<{ items: Invoice[]; total: number }> => (await api.get('/invoices/vouchers')).data;

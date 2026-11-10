@@ -8,6 +8,7 @@
 /* Main Content Area */
 .mainContent {
   flex: 1;
+  min-width: 0;
   margin-left: var(--sidebar-width);
   min-height: 100vh;
   display: flex;
@@ -17,6 +18,7 @@
 /* Content Wrapper */
 .contentWrapper {
   flex: 1;
+  min-width: 0;
   padding: var(--content-padding-y) var(--content-padding-x);
 }
 

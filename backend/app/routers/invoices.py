@@ -1,12 +1,18 @@
 from typing import Optional, List
+import json
 from io import BytesIO
 from datetime import date
+import asyncio
+import hashlib
+import os
+from pathlib import Path
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, BackgroundTasks, Request, Form
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case, update, text
 from decimal import Decimal
 
+from app.services.company_service import company_key_expression, choose_canonical_company_names
 from app.database import get_db
 from app.models.invoice import Invoice, OcrResult, LlmResult, ParsingDiff, InvoiceStatus
 from app.models.user import User as UserModel
@@ -23,6 +29,125 @@ from app.models.user import User
 
 settings = get_settings()
 router = APIRouter()
+
+# 后台解析的并发上限。每个后台任务全程持有一条数据库连接，而 LLM 单次最长 60s、
+# 重试 4 次就是几分钟；批量导入时若放任几十个任务并行，连接池（默认 15 条）会被占满，
+# 之后连 /api/health 都会挂住 —— 整个服务「活着但没反应」。2026-09-21 批量回补时真实踩到。
+# 可以用环境变量 BACKGROUND_PROCESSING_CONCURRENCY 调整（1~16）。
+BACKGROUND_PROCESSING_CONCURRENCY = max(
+    1, min(16, int(os.environ.get("BACKGROUND_PROCESSING_CONCURRENCY", "4")))
+)
+_BACKGROUND_PROCESSING_SLOTS = asyncio.Semaphore(BACKGROUND_PROCESSING_CONCURRENCY)
+APPROVAL_INDEX = Path(os.environ.get('DINGTALK_IMPORT_QUEUE_DIR', '/dingtalk-import-queue')) / 'approvals.json'
+
+
+def _inactive_approval_numbers() -> set[str]:
+    """Use the import worker's refreshed DingTalk approval index for duplicate checks."""
+    try:
+        records = json.loads(APPROVAL_INDEX.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return set()
+    inactive = set()
+    for number, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get('status') or '').upper()
+        result = str(record.get('result') or '').lower()
+        if status in {'TERMINATED', 'CANCELLED', 'CANCELED', 'REVOKED'} or (
+            status == 'COMPLETED' and result in {'refuse', 'reject', 'rejected', 'disagree'}
+        ):
+            inactive.add(str(number).strip())
+    return inactive
+
+
+async def _cross_approval_duplicate_evidence(
+    db: AsyncSession,
+    invoice: Invoice,
+) -> list[str]:
+    """Return distinct approval numbers when this invoice is duplicate-report evidence.
+
+    The same invoice number appearing under different approval numbers is evidence of a
+    possible duplicate reimbursement. Neither copy may be deleted from any UI or API.
+    """
+    invoice_number = (invoice.invoice_number or "").strip()
+    approval_number = (invoice.approval_instance_id or "").strip()
+    if not invoice_number or not approval_number:
+        return []
+
+    result = await db.execute(
+        select(Invoice.approval_instance_id).where(
+            Invoice.document_type == "invoice",
+            func.trim(Invoice.invoice_number) == invoice_number,
+            Invoice.approval_instance_id.is_not(None),
+            func.trim(Invoice.approval_instance_id) != "",
+        )
+    )
+    approval_numbers = {
+        str(value).strip()
+        for value in result.scalars().all()
+        if value and str(value).strip()
+    }
+    approval_numbers -= _inactive_approval_numbers()
+    return sorted(approval_numbers) if len(approval_numbers) >= 2 else []
+
+
+async def _reject_evidence_deletion(db: AsyncSession, invoice: Invoice) -> None:
+    approval_numbers = await _cross_approval_duplicate_evidence(db, invoice)
+    if approval_numbers:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"发票号 {invoice.invoice_number} 同时出现在不同审批单 "
+                f"{', '.join(approval_numbers)}，属于疑似重复报销证据，禁止删除任何一条记录"
+            ),
+        )
+
+
+async def resume_interrupted_processing() -> None:
+    """Resume uploads left behind by a process restart.
+
+    FastAPI BackgroundTasks live only in the web process.  A container restart
+    used to leave their rows permanently in ``已上传`` or ``解析中``.  The rows
+    themselves are durable, so rebuild the in-memory work queue from them at
+    startup.  The shared semaphore still limits actual parsing concurrency.
+    """
+    from app.database import async_session_maker
+
+    async with async_session_maker() as db:
+        # No task can survive a process restart.  Reclassify any inherited
+        # in-flight rows before rebuilding the queue so the UI only shows the
+        # small number of jobs actually running in this server process.
+        await db.execute(
+            update(Invoice)
+            .where(
+                Invoice.document_type == "invoice",
+                Invoice.status == InvoiceStatus.PROCESSING,
+            )
+            .values(status=InvoiceStatus.UPLOADED)
+        )
+        await db.commit()
+
+        result = await db.execute(
+            select(Invoice.id).where(
+                Invoice.document_type == "invoice",
+                Invoice.status == InvoiceStatus.UPLOADED,
+            ).order_by(Invoice.created_at)
+        )
+        invoice_ids = list(result.scalars())
+
+    for invoice_id in invoice_ids:
+        # Recovery must be resilient to a vision gateway that returns an empty
+        # response for some image formats.  OCR keeps the queue moving and the
+        # LLM still validates/extracts fields when it can.
+        # Historical uploads have already spent time in the failed queue.  One
+        # complete OCR + vision pass is sufficient for recovery; files with no
+        # invoice fields are retained in the voucher archive instead of being
+        # retried indefinitely.
+        asyncio.create_task(
+            process_invoice_background(invoice_id, "ocr_and_llm", max_retries=0)
+        )
+        # Let the event loop start queued tasks without blocking application startup.
+        await asyncio.sleep(0)
 
 
 def _parse_invoice_ids(invoice_ids: Optional[str]) -> Optional[List[int]]:
@@ -52,7 +177,12 @@ def _parse_date_param(value: Optional[str], field_name: str) -> Optional[date]:
 
 
 def _apply_user_filter(query, current_user: User):
-    """非管理员只能查看自己上传的发票"""
+    """All signed-in users share the same invoice read scope."""
+    return query
+
+
+def _apply_write_filter(query, current_user: User):
+    """Keep mutations limited to the uploader or an administrator."""
     if not current_user.is_admin:
         query = query.where(Invoice.uploaded_by_id == current_user.id)
     return query
@@ -70,7 +200,10 @@ async def upload_invoices(
     request: Request,
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    processing_mode: str = Form("ocr_and_llm"),
+    processing_mode: str = Form("llm_only"),
+    owner: Optional[str] = Form(None),
+    approval_instance_id: Optional[str] = Form(None),
+    approval_claim_amount: Optional[Decimal] = Form(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -104,6 +237,31 @@ async def upload_invoices(
             ))
             continue
 
+        # The same approval attachment can arrive through manual import and
+        # scheduled scans. Serialize this approval/file pair across requests,
+        # then compare the original bytes before creating another invoice row.
+        if approval_instance_id:
+            if db.get_bind().dialect.name == "postgresql":
+                await db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": f"{approval_instance_id}:{hashlib.sha256(content).hexdigest()}"},
+                )
+            existing = await db.execute(
+                select(Invoice.id).where(
+                    Invoice.approval_instance_id == approval_instance_id,
+                    Invoice.file_data == content,
+                ).limit(1)
+            )
+            existing_id = existing.scalar_one_or_none()
+            if existing_id is not None:
+                results.append(UploadResponse(
+                    id=existing_id,
+                    file_name=file.filename or "unknown",
+                    status="success",
+                    message="附件已存在，已跳过重复上传",
+                ))
+                continue
+
         # Create invoice record with UPLOADED status (not yet processed)
         invoice = Invoice(
             file_name=file.filename or "unknown",
@@ -111,6 +269,15 @@ async def upload_invoices(
             file_data=content,
             status=InvoiceStatus.UPLOADED,
             uploaded_by_id=current_user.id,
+            # Preserve trusted source metadata at creation time.  This is needed
+            # for DingTalk attachment imports because processing may confirm the
+            # invoice before a follow-up edit can run.
+            owner=owner,
+            approval_instance_id=approval_instance_id,
+            approval_claim_amount=approval_claim_amount,
+            # 所有上传先进入发票识别流程；未识别到发票号码的单据会由
+            # invoice_service 自动迁入凭证归档，避免人为误放进发票池。
+            document_type="invoice",
         )
         db.add(invoice)
         await db.flush()
@@ -144,7 +311,7 @@ async def upload_invoices(
     return results
 
 
-async def process_invoice_background(invoice_id: int, processing_mode: str = "ocr_and_llm", max_retries: int = 3):
+async def process_invoice_background(invoice_id: int, processing_mode: str = "llm_only", max_retries: int = 3):
     """Background task to process an invoice with OCR/LLM.
 
     Implements exponential backoff retry logic for transient failures.
@@ -156,6 +323,12 @@ async def process_invoice_background(invoice_id: int, processing_mode: str = "oc
         processing_mode: One of 'ocr_only', 'llm_only', 'ocr_and_llm'
         max_retries: Maximum number of retries after the initial attempt (default: 3,
             resulting in up to 4 total attempts)
+
+    ⚠️ 并发闸门：这个任务从头到尾持有一条数据库连接，而 LLM 单次最长 60s、
+    重试 4 次就是几分钟。批量导入时上传每 7 秒来一个，几十个后台任务同时压在
+    连接池上（默认 pool_size=5 + max_overflow=10 = 15 条）→ 池子被占满，
+    之后**所有**请求（包括 /api/health）都会无限期挂住，整个服务看着是「活着但没反应」。
+    2026-09-21 批量回补时真实踩到，所以用信号量把并发的后台解析限死在几条以内。
     """
     from app.services.invoice_service import process_invoice as do_process
     from app.database import async_session_maker
@@ -164,79 +337,141 @@ async def process_invoice_background(invoice_id: int, processing_mode: str = "oc
     import asyncio
     logger = logging.getLogger(__name__)
 
-    retry_count = 0
-    last_error = None
+    async with _BACKGROUND_PROCESSING_SLOTS:
+        retry_count = 0
+        last_error = None
+        original_status = None
 
-    while retry_count <= max_retries:
+        while retry_count <= max_retries:
+            async with async_session_maker() as db:
+                try:
+                    # Update status to PROCESSING
+                    query = select(Invoice).where(Invoice.id == invoice_id)
+                    result = await db.execute(query)
+                    invoice = result.scalar_one_or_none()
+
+                    if not invoice:
+                        logger.error(f"Invoice {invoice_id} not found")
+                        return
+
+                    if invoice.status == InvoiceStatus.CONFIRMED:
+                        logger.info("Skip processing locked invoice %s", invoice_id)
+                        return
+
+                    if original_status is None:
+                        # PROCESSING is an in-flight state, not a recoverable
+                        # business state.  It can be left behind by a process
+                        # restart, so exhausted retries must return it to the
+                        # visible, retryable uploaded state instead of keeping
+                        # a perpetual "解析中" badge.
+                        original_status = (
+                            InvoiceStatus.UPLOADED
+                            if invoice.status == InvoiceStatus.PROCESSING
+                            else invoice.status
+                        )
+                    invoice.status = InvoiceStatus.PROCESSING
+                    await db.commit()
+
+                    logger.info(f"Background processing invoice {invoice_id} mode={processing_mode} (attempt {retry_count + 1}/{max_retries + 1})")
+                    success = await do_process(invoice_id, db, processing_mode)
+
+                    if success:
+                        logger.info(f"Invoice {invoice_id} processing completed successfully")
+                        # Log successful processing
+                        await log_audit(
+                            db=db,
+                            entity_type="invoice",
+                            entity_id=invoice_id,
+                            action="process_complete",
+                            new_value={"status": "success", "attempts": retry_count + 1}
+                        )
+                        await db.refresh(invoice)
+                        from app.services.approval_match_service import queue_dingtalk_lookup
+                        queue_dingtalk_lookup(invoice)
+                        from app.services.dingtalk_sync_service import (
+                            resolve_sync_sequence,
+                            sync_invoice_to_dingtalk,
+                        )
+                        synced = await sync_invoice_to_dingtalk(
+                            invoice, await resolve_sync_sequence(db, invoice)
+                        )
+                        logger.info("Invoice %s DingTalk sync result: %s", invoice_id, synced)
+                        return
+                    else:
+                        last_error = "Processing returned false"
+                        logger.warning(f"Invoice {invoice_id} processing returned false")
+                        # A configured vision model can still return an empty
+                        # result for a particular image.  Retry through OCR so
+                        # text-bearing invoices are not retried identically.
+                        if processing_mode == "llm_only":
+                            processing_mode = "ocr_and_llm"
+                            logger.info(
+                                "Invoice %s retry will use OCR + LLM fallback",
+                                invoice_id,
+                            )
+
+                except Exception as e:
+                    last_error = str(e)
+                    logger.error(f"Failed to process invoice {invoice_id} (attempt {retry_count + 1}): {e}")
+                    await db.rollback()
+
+            retry_count += 1
+
+            if retry_count <= max_retries:
+                # Exponential backoff: 2^retry_count seconds (2, 4, 8 seconds)
+                delay = 2 ** retry_count
+                logger.info(f"Retrying invoice {invoice_id} in {delay} seconds...")
+                await asyncio.sleep(delay)
+
+        # All retries exhausted - mark as failed
         async with async_session_maker() as db:
             try:
-                # Update status to PROCESSING
                 query = select(Invoice).where(Invoice.id == invoice_id)
                 result = await db.execute(query)
                 invoice = result.scalar_one_or_none()
 
-                if not invoice:
-                    logger.error(f"Invoice {invoice_id} not found")
-                    return
+                if invoice:
+                    # New uploads with no usable result after all OCR + vision
+                    # attempts are not invoices that can remain in the invoice
+                    # list.  Preserve their original file in the voucher archive
+                    # for review, without sending it to DingTalk or retrying it
+                    # forever.  Existing reviewed/confirmed invoices keep their
+                    # prior business state when a later reparse fails.
+                    archive_unrecognized = (
+                        original_status == InvoiceStatus.UPLOADED
+                        and last_error == "Processing returned false"
+                    )
+                    if archive_unrecognized:
+                        invoice.document_type = "voucher"
+                        invoice.status = InvoiceStatus.REVIEWING
+                    else:
+                        invoice.status = original_status or InvoiceStatus.UPLOADED
+                    await db.commit()
 
-                invoice.status = InvoiceStatus.PROCESSING
-                await db.commit()
-
-                logger.info(f"Background processing invoice {invoice_id} mode={processing_mode} (attempt {retry_count + 1}/{max_retries + 1})")
-                success = await do_process(invoice_id, db, processing_mode)
-
-                if success:
-                    logger.info(f"Invoice {invoice_id} processing completed successfully")
-                    # Log successful processing
+                    # Keep a durable trail for either a real processing failure
+                    # or automatic archive classification.
                     await log_audit(
                         db=db,
                         entity_type="invoice",
                         entity_id=invoice_id,
-                        action="process_complete",
-                        new_value={"status": "success", "attempts": retry_count + 1}
+                        action=("archive_unrecognized" if archive_unrecognized else "process_failed"),
+                        new_value={
+                            "error": last_error,
+                            "attempts": max_retries + 1,
+                            "document_type": "voucher" if archive_unrecognized else "invoice",
+                        }
                     )
-                    return
+
+                if invoice and archive_unrecognized:
+                    logger.info(
+                        "Invoice %s had no valid invoice fields after %s attempts; archived as voucher",
+                        invoice_id,
+                        max_retries + 1,
+                    )
                 else:
-                    last_error = "Processing returned false"
-                    logger.warning(f"Invoice {invoice_id} processing returned false")
-
+                    logger.error(f"Invoice {invoice_id} processing failed after {max_retries + 1} attempts: {last_error}")
             except Exception as e:
-                last_error = str(e)
-                logger.error(f"Failed to process invoice {invoice_id} (attempt {retry_count + 1}): {e}")
-                await db.rollback()
-
-        retry_count += 1
-
-        if retry_count <= max_retries:
-            # Exponential backoff: 2^retry_count seconds (2, 4, 8 seconds)
-            delay = 2 ** retry_count
-            logger.info(f"Retrying invoice {invoice_id} in {delay} seconds...")
-            await asyncio.sleep(delay)
-
-    # All retries exhausted - mark as failed
-    async with async_session_maker() as db:
-        try:
-            query = select(Invoice).where(Invoice.id == invoice_id)
-            result = await db.execute(query)
-            invoice = result.scalar_one_or_none()
-
-            if invoice:
-                # Set status back to UPLOADED so user can retry manually
-                invoice.status = InvoiceStatus.UPLOADED
-                await db.commit()
-
-                # Log failed processing
-                await log_audit(
-                    db=db,
-                    entity_type="invoice",
-                    entity_id=invoice_id,
-                    action="process_failed",
-                    new_value={"error": last_error, "attempts": max_retries + 1}
-                )
-
-            logger.error(f"Invoice {invoice_id} processing failed after {max_retries + 1} attempts: {last_error}")
-        except Exception as e:
-            logger.error(f"Failed to update invoice {invoice_id} status after retry exhaustion: {e}")
+                logger.error(f"Failed to update invoice {invoice_id} status after retry exhaustion: {e}")
 
 
 @router.get("", response_model=InvoiceListResponse)
@@ -249,12 +484,30 @@ async def list_invoices(
     end_date: Optional[str] = Query(None, description="结束日期"),
     invoice_number: Optional[str] = Query(None, description="发票号码（模糊）"),
     keyword: Optional[str] = Query(None, description="关键词（发票号/购买方/销售方）"),
+    company_key: Optional[str] = Query(None, description="购买方公司分类"),
+    party_type: Optional[str] = Query(None, pattern="^(company|person)$", description="购买方类型"),
+    buyer_keyword: Optional[str] = Query(None, description="购买方名称关键词"),
+    approval_number: Optional[str] = Query(None, description="审批编号"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """获取发票列表"""
     query = select(Invoice)
     query = _apply_user_filter(query, current_user)
+    query = query.where(Invoice.document_type == "invoice")
+
+    if company_key is not None:
+        query = query.where(company_key_expression() == company_key)
+    buyer_tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    buyer_name = func.nullif(func.trim(Invoice.buyer_name), '')
+    if party_type == "company":
+        query = query.where(buyer_tax_id.is_not(None))
+    elif party_type == "person":
+        query = query.where(buyer_tax_id.is_(None), buyer_name.is_not(None))
+    if buyer_keyword:
+        query = query.where(Invoice.buyer_name.ilike(f"%{buyer_keyword}%"))
+    if approval_number:
+        query = query.where(Invoice.approval_instance_id == approval_number)
 
     # Apply filters
     if status:
@@ -279,6 +532,7 @@ async def list_invoices(
         from sqlalchemy import or_
         query = query.where(or_(
             Invoice.invoice_number.ilike(f"%{keyword}%"),
+            Invoice.approval_instance_id.ilike(f"%{keyword}%"),
             Invoice.buyer_name.ilike(f"%{keyword}%"),
             Invoice.seller_name.ilike(f"%{keyword}%"),
         ))
@@ -318,6 +572,154 @@ async def list_invoices(
     )
 
 
+@router.get("/sync-records", response_model=InvoiceListResponse)
+async def list_sync_records(
+    approval_number: str = Query(..., min_length=1, description="审批编号"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=100, description="每页数量"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return every backend source record for one approval, without business filtering.
+
+    This endpoint is intentionally different from the invoice-list endpoint: DingTalk
+    ledger synchronization mirrors the source records exactly, so vouchers, empty
+    invoice numbers, and duplicate invoice numbers are all included. ``Invoice.id`` is
+    the stable technical identity; invoice number is display data only.
+    """
+    query = _apply_user_filter(
+        select(Invoice).where(Invoice.approval_instance_id == approval_number),
+        current_user,
+    )
+    count_query = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_query) or 0
+    result = await db.execute(
+        query.order_by(Invoice.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    records = result.scalars().all()
+    return InvoiceListResponse(
+        items=[InvoiceResponse.model_validate(record) for record in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/processing-status")
+async def get_processing_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return parsing progress independently of the current list page."""
+    invoice_query = select(Invoice.status, func.count()).where(
+        Invoice.document_type == "invoice"
+    )
+    invoice_query = _apply_user_filter(invoice_query, current_user)
+    invoice_rows = (await db.execute(invoice_query.group_by(Invoice.status))).all()
+    counts = {
+        (status.value if isinstance(status, InvoiceStatus) else str(status)): count
+        for status, count in invoice_rows
+    }
+
+    voucher_query = select(func.count()).select_from(Invoice).where(
+        Invoice.document_type == "voucher"
+    )
+    voucher_query = _apply_user_filter(voucher_query, current_user)
+    archived_vouchers = await db.scalar(voucher_query) or 0
+
+    queued = counts.get(InvoiceStatus.UPLOADED.value, 0)
+    processing = counts.get(InvoiceStatus.PROCESSING.value, 0)
+    return {
+        "queued": queued,
+        "processing": processing,
+        "pending": queued + processing,
+        "reviewing": counts.get(InvoiceStatus.REVIEWING.value, 0),
+        "confirmed": counts.get(InvoiceStatus.CONFIRMED.value, 0),
+        "archived_vouchers": archived_vouchers,
+    }
+
+
+@router.get("/vouchers", response_model=InvoiceListResponse)
+async def list_vouchers(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    query = _apply_user_filter(select(Invoice).where(Invoice.document_type == "voucher"), current_user).order_by(Invoice.created_at.desc())
+    rows = (await db.execute(query)).scalars().all()
+    return InvoiceListResponse(items=[InvoiceResponse.model_validate(row) for row in rows], total=len(rows), page=1, page_size=len(rows) or 20)
+
+
+@router.get("/companies")
+async def list_companies(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate only accessible invoices by buyer tax ID, falling back to name."""
+    key = company_key_expression()
+    company_tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    query = select(
+        key.label("key"),
+        func.max(func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')).label("tax_id"),
+        func.count(Invoice.id).label("invoice_count"),
+        func.coalesce(func.sum(Invoice.total_with_tax), 0).label("total_amount"),
+        func.sum(case((Invoice.total_with_tax.is_(None), 1), else_=0)).label("missing_amount_count"),
+        func.sum(case((Invoice.status == InvoiceStatus.REVIEWING, 1), else_=0)).label("review_count"),
+    ).where(company_tax_id.is_not(None)).group_by(key).order_by(func.count(Invoice.id).desc(), key)
+    rows = (await db.execute(_apply_user_filter(query, current_user))).mappings().all()
+
+    normalized_name = func.nullif(func.trim(Invoice.buyer_name), '')
+    name_query = select(
+        key.label("key"),
+        normalized_name.label("name"),
+        func.count(Invoice.id).label("occurrences"),
+        func.max(Invoice.issue_date).label("latest_issue_date"),
+        func.max(Invoice.id).label("latest_id"),
+    ).where(
+        company_tax_id.is_not(None),
+        normalized_name.is_not(None),
+    ).group_by(key, normalized_name)
+    name_rows = (
+        await db.execute(_apply_user_filter(name_query, current_user))
+    ).mappings().all()
+    canonical_names = choose_canonical_company_names(name_rows)
+
+    return {
+        "items": [
+            dict(
+                row,
+                name=canonical_names.get(row["key"]),
+                total_amount=str(row["total_amount"]),
+            )
+            for row in rows
+        ]
+    }
+
+
+@router.get("/persons")
+async def list_persons(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate accessible invoices whose buyer has a name but no tax ID."""
+    key = company_key_expression()
+    name = func.nullif(func.trim(Invoice.buyer_name), '')
+    tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    query = select(
+        key.label("key"),
+        name.label("name"),
+        func.count(Invoice.id).label("invoice_count"),
+        func.coalesce(func.sum(Invoice.total_with_tax), 0).label("total_amount"),
+        func.sum(case((Invoice.total_with_tax.is_(None), 1), else_=0)).label("missing_amount_count"),
+        func.sum(case((Invoice.status == InvoiceStatus.REVIEWING, 1), else_=0)).label("review_count"),
+    ).where(
+        tax_id.is_(None),
+        name.is_not(None),
+    ).group_by(key, name).order_by(func.count(Invoice.id).desc(), name)
+    rows = (await db.execute(_apply_user_filter(query, current_user))).mappings().all()
+    return {
+        "items": [dict(row, total_amount=str(row["total_amount"])) for row in rows]
+    }
+
+
 @router.get("/statistics", response_model=StatisticsResponse)
 async def get_statistics(
     invoice_ids: Optional[str] = Query(None, description="发票ID列表，逗号分隔"),
@@ -327,7 +729,7 @@ async def get_statistics(
     db: AsyncSession = Depends(get_db)
 ):
     """获取发票统计数据"""
-    query = select(Invoice)
+    query = select(Invoice).where(Invoice.document_type == "invoice")
     query = _apply_user_filter(query, current_user)
 
     ids = _parse_invoice_ids(invoice_ids)
@@ -354,63 +756,50 @@ async def get_statistics(
     )
 
 
+def _cross_approval_duplicate_candidates(
+    all_invoices: list[Invoice], inactive_approvals: Optional[set[str]] = None
+) -> dict[str, list[Invoice]]:
+    """Return one representative per approval only when a number spans approvals."""
+    from collections import defaultdict
+    by_number: dict[str, dict[str, Invoice]] = defaultdict(dict)
+    inactive_approvals = inactive_approvals or set()
+    for invoice in all_invoices:
+        invoice_number = (invoice.invoice_number or "").strip()
+        approval_number = (invoice.approval_instance_id or "").strip()
+        # 空值、占位符或短识别片段不属于发票号码，绝不能互相判重。
+        if invoice_number.isdigit() and len(invoice_number) >= 6 and approval_number and approval_number not in inactive_approvals:
+            # 同审批号的多次上传只保留一个代表；它们属于导入去重，
+            # 不应挤占“跨审批重复报销”的查重页面。
+            by_number[invoice_number].setdefault(approval_number, invoice)
+
+    return {
+        number: list(approvals.values())
+        for number, approvals in by_number.items()
+        if len(approvals) >= 2
+    }
+
+
 @router.get("/duplicates", response_model=DuplicateCheckResponse)
 async def check_duplicates(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """查重：检测系统中存在的重复发票。
-    
-    优先按发票号码检测，其次按(销售方税号+购买方税号+开票日期+价税合计)组合检测。
-    """
-    from collections import defaultdict
-
-    result = await db.execute(_apply_user_filter(select(Invoice), current_user).order_by(Invoice.id))
-    all_invoices = result.scalars().all()
-
-    groups: list[DuplicateGroup] = []
-    already_grouped_ids: set[int] = set()
-
-    # --- Pass 1: group by invoice_number ---
-    by_number: dict[str, list[Invoice]] = defaultdict(list)
-    for inv in all_invoices:
-        if inv.invoice_number and inv.invoice_number.strip():
-            by_number[inv.invoice_number.strip()].append(inv)
-
-    for number, invs in by_number.items():
-        if len(invs) >= 2:
-            groups.append(DuplicateGroup(
-                reason="发票号码相同",
-                duplicate_key=number,
-                invoices=[InvoiceResponse.model_validate(inv) for inv in invs],
-            ))
-            for inv in invs:
-                already_grouped_ids.add(inv.id)
-
-    # --- Pass 2: group by (seller_tax_id, buyer_tax_id, issue_date, total_with_tax) ---
-    by_fields: dict[tuple, list[Invoice]] = defaultdict(list)
-    for inv in all_invoices:
-        if inv.id in already_grouped_ids:
-            continue
-        if inv.seller_tax_id and inv.buyer_tax_id and inv.issue_date and inv.total_with_tax is not None:
-            key = (
-                inv.seller_tax_id.strip(),
-                inv.buyer_tax_id.strip(),
-                str(inv.issue_date),
-                str(inv.total_with_tax),
-            )
-            by_fields[key].append(inv)
-
-    for key_tuple, invs in by_fields.items():
-        if len(invs) >= 2:
-            key_str = f"销方税号{key_tuple[0]} / 购方税号{key_tuple[1]} / {key_tuple[2]} / ¥{key_tuple[3]}"
-            groups.append(DuplicateGroup(
-                reason="关键字段完全一致",
-                duplicate_key=key_str,
-                invoices=[InvoiceResponse.model_validate(inv) for inv in invs],
-            ))
-
-    total_duplicates = sum(len(g.invoices) for g in groups)
+    """Only the same valid invoice number across different approval numbers counts."""
+    result = await db.execute(
+        _apply_user_filter(select(Invoice), current_user)
+        .where(Invoice.document_type == "invoice")
+        .order_by(Invoice.id)
+    )
+    by_number = _cross_approval_duplicate_candidates(result.scalars().all(), _inactive_approval_numbers())
+    groups = [
+        DuplicateGroup(
+            reason="同发票号出现在不同审批编号",
+            duplicate_key=invoice_number,
+            invoices=[InvoiceResponse.model_validate(invoice) for invoice in invoices],
+        )
+        for invoice_number, invoices in by_number.items()
+    ]
+    total_duplicates = sum(len(group.invoices) for group in groups)
     return DuplicateCheckResponse(
         total_groups=len(groups),
         total_duplicates=total_duplicates,
@@ -458,8 +847,6 @@ async def get_invoice(
     if not invoice:
         raise HTTPException(status_code=404, detail="发票不存在")
 
-    _check_invoice_access(invoice, current_user)
-
     # Load related data
     ocr_query = select(OcrResult).where(OcrResult.invoice_id == invoice_id)
     ocr_result = await db.execute(ocr_query)
@@ -480,6 +867,7 @@ async def get_invoice(
         "file_type": invoice.file_type,
         "status": invoice.status,
         "owner": invoice.owner,
+        "approval_instance_id": invoice.approval_instance_id,
         "uploaded_by_id": invoice.uploaded_by_id,
         "invoice_number": invoice.invoice_number,
         "issue_date": invoice.issue_date,
@@ -532,8 +920,6 @@ async def get_invoice_file(
     if not invoice:
         raise HTTPException(status_code=404, detail="发票不存在")
 
-    _check_invoice_access(invoice, current_user)
-
     content_type_map = {
         "pdf": "application/pdf",
         "jpg": "image/jpeg",
@@ -569,6 +955,8 @@ async def update_invoice(
         raise HTTPException(status_code=404, detail="发票不存在")
 
     _check_invoice_access(invoice, current_user)
+    if invoice.status == InvoiceStatus.CONFIRMED:
+        raise HTTPException(status_code=409, detail="发票已确认并锁定，请先取消锁定后再编辑。")
 
     # Capture old values for audit
     update_dict = update_data.model_dump(exclude_unset=True)
@@ -622,9 +1010,12 @@ async def batch_update_invoices(
     db: AsyncSession = Depends(get_db)
 ):
     """批量更新发票状态/归属人"""
-    query = _apply_user_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
+    query = _apply_write_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
     result = await db.execute(query)
     invoices = result.scalars().all()
+    locked_ids = [invoice.id for invoice in invoices if invoice.status == InvoiceStatus.CONFIRMED]
+    if locked_ids:
+        raise HTTPException(status_code=409, detail="选中的发票包含已确认锁定项，请先取消锁定后再修改。")
 
     client_info = get_client_info(request)
     updated_count = 0
@@ -674,12 +1065,17 @@ async def batch_delete_invoices(
         raise HTTPException(status_code=400, detail="请选择要删除的发票")
 
     # Query invoices to delete
-    query = _apply_user_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
+    query = _apply_write_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
     result = await db.execute(query)
     invoices = result.scalars().all()
 
     if not invoices:
         raise HTTPException(status_code=404, detail="未找到要删除的发票")
+
+    # Validate the whole batch before deleting anything, so one protected record
+    # cannot leave the request half-applied.
+    for invoice in invoices:
+        await _reject_evidence_deletion(db, invoice)
 
     client_info = get_client_info(request)
     deleted_count = 0
@@ -705,6 +1101,86 @@ async def batch_delete_invoices(
     }
 
 
+@router.post("/batch-archive-vouchers")
+@limiter.limit("20/minute")
+async def batch_archive_vouchers(
+    request: Request,
+    batch_request: BatchDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark reviewed records as non-invoices and retain them in the voucher archive."""
+    if not batch_request.invoice_ids:
+        raise HTTPException(status_code=400, detail="请选择要归档的单据")
+
+    query = _apply_write_filter(select(Invoice), current_user).where(
+        Invoice.id.in_(batch_request.invoice_ids),
+        Invoice.document_type == "invoice",
+    )
+    invoices = (await db.execute(query)).scalars().all()
+    if len(invoices) != len(set(batch_request.invoice_ids)):
+        raise HTTPException(status_code=404, detail="部分发票不存在或无权操作")
+    if any(invoice.status == InvoiceStatus.CONFIRMED for invoice in invoices):
+        raise HTTPException(status_code=409, detail="已确认锁定的发票不能归档，请先取消锁定")
+    if any(invoice.status != InvoiceStatus.REVIEWING for invoice in invoices):
+        raise HTTPException(status_code=400, detail="只有待审核单据可以标记为非发票")
+
+    client_info = get_client_info(request)
+    for invoice in invoices:
+        await log_audit_no_commit(
+            db=db,
+            entity_type="invoice",
+            entity_id=invoice.id,
+            action="archive_as_voucher",
+            old_value={"document_type": invoice.document_type, "status": invoice.status.value},
+            new_value={"document_type": "voucher", "status": InvoiceStatus.REVIEWING.value},
+            ip_address=client_info.get("ip_address"),
+            user_agent=client_info.get("user_agent"),
+        )
+        invoice.document_type = "voucher"
+        invoice.status = InvoiceStatus.REVIEWING
+
+    await db.commit()
+    return {"message": f"已归档 {len(invoices)} 份凭证", "archived_count": len(invoices)}
+
+
+@router.post("/batch-unlock")
+async def batch_unlock_invoices(
+    request: Request,
+    batch_request: BatchDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unlock selected confirmed invoices; leave every other status untouched."""
+    invoice_ids = set(batch_request.invoice_ids)
+    if not invoice_ids:
+        raise HTTPException(status_code=400, detail="请选择要取消锁定的发票")
+    result = await db.execute(
+        _apply_write_filter(select(Invoice), current_user).where(
+            Invoice.id.in_(invoice_ids), Invoice.document_type == "invoice"
+        )
+    )
+    invoices = result.scalars().all()
+    if len(invoices) != len(invoice_ids):
+        raise HTTPException(status_code=404, detail="部分发票不存在或无权操作")
+    client_info = get_client_info(request)
+    unlocked = 0
+    for invoice in invoices:
+        if invoice.status != InvoiceStatus.CONFIRMED:
+            continue
+        invoice.status = InvoiceStatus.REVIEWING
+        await log_audit_no_commit(
+            db=db, entity_type="invoice", entity_id=invoice.id, action="unlock",
+            old_value={"status": InvoiceStatus.CONFIRMED.value},
+            new_value={"status": InvoiceStatus.REVIEWING.value},
+            ip_address=client_info.get("ip_address"), user_agent=client_info.get("user_agent"),
+        )
+        unlocked += 1
+    await db.commit()
+    return {"message": f"已取消锁定 {unlocked} 张；跳过 {len(invoices) - unlocked} 张未锁定发票",
+            "unlocked": unlocked, "skipped": len(invoices) - unlocked}
+
+
 @router.post("/batch-reprocess")
 @limiter.limit("5/minute")
 async def batch_reprocess_invoices(
@@ -714,7 +1190,7 @@ async def batch_reprocess_invoices(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """批量重新解析发票（清除旧的OCR/LLM结果，重新处理）"""
+    """批量重新解析发票（有效结果产生前保留原数据）"""
     import logging
     logger = logging.getLogger(__name__)
 
@@ -722,64 +1198,123 @@ async def batch_reprocess_invoices(
         raise HTTPException(status_code=400, detail="请选择要重新解析的发票")
 
     # Query invoices to reprocess
-    query = _apply_user_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
+    query = _apply_write_filter(select(Invoice), current_user).where(Invoice.id.in_(batch_request.invoice_ids))
     result = await db.execute(query)
     invoices = result.scalars().all()
 
     if not invoices:
         raise HTTPException(status_code=404, detail="未找到要重新解析的发票")
+    if any(invoice.status == InvoiceStatus.CONFIRMED for invoice in invoices):
+        raise HTTPException(status_code=409, detail="选中的发票包含已确认锁定项，请先取消锁定后再重新解析。")
 
-    # Clear old parsing results and reset invoice fields
-    for invoice in invoices:
-        # Delete old OCR results
-        ocr_query = select(OcrResult).where(OcrResult.invoice_id == invoice.id)
-        ocr_result = await db.execute(ocr_query)
-        for ocr in ocr_result.scalars().all():
-            await db.delete(ocr)
-
-        # Delete old LLM results
-        llm_query = select(LlmResult).where(LlmResult.invoice_id == invoice.id)
-        llm_result = await db.execute(llm_query)
-        for llm in llm_result.scalars().all():
-            await db.delete(llm)
-
-        # Delete old parsing diffs
-        diff_query = select(ParsingDiff).where(ParsingDiff.invoice_id == invoice.id)
-        diff_result = await db.execute(diff_query)
-        for diff in diff_result.scalars().all():
-            await db.delete(diff)
-
-        # Reset invoice fields
-        invoice.invoice_number = None
-        invoice.issue_date = None
-        invoice.buyer_name = None
-        invoice.buyer_tax_id = None
-        invoice.seller_name = None
-        invoice.seller_tax_id = None
-        invoice.item_name = None
-        invoice.total_with_tax = None
-        invoice.amount = None
-        invoice.tax_amount = None
-        invoice.tax_rate = None
-        invoice.status = InvoiceStatus.UPLOADED
-
-    await db.commit()
-    logger.info(f"Cleared old parsing results for {len(invoices)} invoices, scheduling reprocess")
+    # Keep saved fields and parsing evidence until a valid replacement commits.
+    logger.info(f"Scheduling safe reprocess for {len(invoices)} invoices")
 
     # Schedule background processing
     for invoice in invoices:
-        background_tasks.add_task(process_invoice_background, invoice.id, "ocr_and_llm")
+        background_tasks.add_task(process_invoice_background, invoice.id, "ocr_and_llm", max_retries=0)
 
     return {
-        "message": f"已清除 {len(invoices)} 张发票的旧解析结果，正在重新解析",
+        "message": f"正在重新解析 {len(invoices)} 张发票；失败时保留原数据",
         "count": len(invoices)
     }
+
+
+@router.post("/batch-sync")
+@limiter.limit("10/minute")
+async def batch_sync_invoices_to_dingtalk(
+    request: Request,
+    invoice_ids: Optional[str] = Query(None, description="发票ID列表，逗号分隔"),
+    status: Optional[InvoiceStatus] = Query(None, description="状态筛选"),
+    owner: Optional[str] = Query(None, description="归属人筛选"),
+    start_date: Optional[str] = Query(None, description="开始日期"),
+    end_date: Optional[str] = Query(None, description="结束日期"),
+    keyword: Optional[str] = Query(None, description="关键词"),
+    company_key: Optional[str] = Query(None, description="购买方公司分类"),
+    party_type: Optional[str] = Query(None, pattern="^(company|person)$", description="购买方类型"),
+    buyer_keyword: Optional[str] = Query(None, description="购买方名称关键词"),
+    approval_number: Optional[str] = Query(None, description="审批编号"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue selected or filtered invoices for DingTalk synchronization."""
+    query = _apply_write_filter(select(Invoice), current_user)
+    query = query.where(Invoice.document_type == "invoice")
+    ids = _parse_invoice_ids(invoice_ids)
+    if ids:
+        query = query.where(Invoice.id.in_(ids))
+    if status:
+        query = query.where(Invoice.status == status)
+    if owner:
+        query = query.where(Invoice.owner == owner)
+    if company_key is not None:
+        query = query.where(company_key_expression() == company_key)
+    buyer_tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    buyer_name = func.nullif(func.trim(Invoice.buyer_name), '')
+    if party_type == "company":
+        query = query.where(buyer_tax_id.is_not(None))
+    elif party_type == "person":
+        query = query.where(buyer_tax_id.is_(None), buyer_name.is_not(None))
+    if buyer_keyword:
+        query = query.where(Invoice.buyer_name.ilike(f"%{buyer_keyword}%"))
+    if approval_number:
+        query = query.where(Invoice.approval_instance_id == approval_number)
+    if keyword:
+        from sqlalchemy import or_
+        query = query.where(or_(
+            Invoice.invoice_number.ilike(f"%{keyword}%"),
+            Invoice.buyer_name.ilike(f"%{keyword}%"),
+            Invoice.seller_name.ilike(f"%{keyword}%"),
+        ))
+    start_date_obj = _parse_date_param(start_date, "start_date")
+    if start_date_obj:
+        query = query.where(Invoice.issue_date >= start_date_obj)
+    end_date_obj = _parse_date_param(end_date, "end_date")
+    if end_date_obj:
+        query = query.where(Invoice.issue_date <= end_date_obj)
+
+    invoices = (await db.execute(query.order_by(Invoice.id))).scalars().all()
+    if not invoices:
+        raise HTTPException(status_code=404, detail="当前条件下没有可同步的发票")
+
+    from app.services.dingtalk_sync_service import (
+        resolve_sync_sequence,
+        sync_invoice_to_dingtalk,
+    )
+    queued = 0
+    not_reimbursement = 0
+    skipped_voucher = 0
+    failed = 0
+    for invoice in invoices:
+        # 钉钉表只收报销数据：没有审批单号的一律跳过，避免该表出现空归属人/空审批单号的行
+        if not (invoice.approval_instance_id or "").strip():
+            not_reimbursement += 1
+            continue
+        sequence = await resolve_sync_sequence(db, invoice)
+        # 无票号的凭证：resolve_sync_sequence 返回 None 表示「配套单据/金额为空」，
+        # 按规则本就不该进表，不能算入队失败。
+        if sequence is None and not (invoice.invoice_number or "").strip():
+            skipped_voucher += 1
+            continue
+        if await sync_invoice_to_dingtalk(invoice, sequence):
+            queued += 1
+        else:
+            failed += 1
+    message = f"已提交 {queued} 张发票同步到钉钉"
+    if not_reimbursement:
+        message += f"；跳过 {not_reimbursement} 张非报销发票（无审批单号）"
+    if skipped_voucher:
+        message += f"；跳过 {skipped_voucher} 张凭证（配套单据或金额为空）"
+    if failed:
+        message += f"；{failed} 张入队失败"
+    return {"message": message, "count": queued, "skipped_not_reimbursement": not_reimbursement,
+            "skipped_voucher": skipped_voucher, "failed": failed}
 
 
 @router.post("/{invoice_id}/process")
 async def process_invoice(
     invoice_id: int,
-    processing_mode: str = Query("ocr_and_llm", description="处理模式: ocr_only / llm_only / ocr_and_llm"),
+    processing_mode: str = Query("llm_only", description="处理模式: ocr_only / llm_only / ocr_and_llm"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -794,13 +1329,23 @@ async def process_invoice(
         raise HTTPException(status_code=404, detail="发票不存在")
 
     _check_invoice_access(invoice, current_user)
+    if invoice.status == InvoiceStatus.CONFIRMED:
+        raise HTTPException(status_code=409, detail="发票已确认并锁定，请先取消锁定后再重新解析。")
 
     success = await do_process(invoice_id, db, processing_mode)
 
     if success:
+        await db.refresh(invoice)
+        from app.services.approval_match_service import queue_dingtalk_lookup
+        queue_dingtalk_lookup(invoice)
+        from app.services.dingtalk_sync_service import (
+            resolve_sync_sequence,
+            sync_invoice_to_dingtalk,
+        )
+        await sync_invoice_to_dingtalk(invoice, await resolve_sync_sequence(db, invoice))
         return {"message": "解析成功", "invoice_id": invoice_id}
     else:
-        raise HTTPException(status_code=500, detail="解析失败")
+        raise HTTPException(status_code=502, detail="解析失败：识别服务未返回有效且完整的结果，请检查模型服务或额度。原有数据已保留。")
 
 
 @router.delete("/{invoice_id}")
@@ -819,6 +1364,7 @@ async def delete_invoice(
         raise HTTPException(status_code=404, detail="发票不存在")
 
     _check_invoice_access(invoice, current_user)
+    await _reject_evidence_deletion(db, invoice)
 
     # Audit log
     client_info = get_client_info(request)
@@ -857,6 +1403,8 @@ async def resolve_diff(
     if not inv_for_check:
         raise HTTPException(status_code=404, detail="发票不存在")
     _check_invoice_access(inv_for_check, current_user)
+    if inv_for_check.status == InvoiceStatus.CONFIRMED:
+        raise HTTPException(status_code=409, detail="发票已确认并锁定，请先取消锁定后再修改比对结果。")
 
     # Get the diff
     diff_query = select(ParsingDiff).where(
@@ -971,6 +1519,8 @@ async def confirm_invoice(
         raise HTTPException(status_code=404, detail="发票不存在")
 
     _check_invoice_access(invoice, current_user)
+    if invoice.status == InvoiceStatus.CONFIRMED:
+        return {"message": "发票已确认并锁定", "resolved_count": 0}
 
     critical_fields = [
         "invoice_number",
@@ -1041,6 +1591,68 @@ async def confirm_invoice(
     return {"message": "发票已确认", "resolved_count": len(diffs)}
 
 
+@router.post("/{invoice_id}/archive-voucher")
+async def archive_invoice_as_voucher(
+    invoice_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive a reviewed record as a non-invoice without deleting its file."""
+    invoice = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one_or_none()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="发票不存在")
+    _check_invoice_access(invoice, current_user)
+    if invoice.document_type == "voucher":
+        return {"message": "该单据已归档为凭证"}
+    if invoice.status == InvoiceStatus.CONFIRMED:
+        raise HTTPException(status_code=409, detail="已确认锁定的发票不能归档，请先取消锁定")
+    if invoice.status != InvoiceStatus.REVIEWING:
+        raise HTTPException(status_code=400, detail="只有待审核单据可以标记为非发票")
+
+    client_info = get_client_info(request)
+    await log_audit_no_commit(
+        db=db,
+        entity_type="invoice",
+        entity_id=invoice.id,
+        action="archive_as_voucher",
+        old_value={"document_type": invoice.document_type, "status": invoice.status.value},
+        new_value={"document_type": "voucher", "status": InvoiceStatus.REVIEWING.value},
+        ip_address=client_info.get("ip_address"),
+        user_agent=client_info.get("user_agent"),
+    )
+    invoice.document_type = "voucher"
+    invoice.status = InvoiceStatus.REVIEWING
+    await db.commit()
+    return {"message": "已归档到凭证备份"}
+
+
+@router.post("/{invoice_id}/unlock")
+async def unlock_invoice(
+    invoice_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cancel confirmation so the invoice can be edited or reprocessed again."""
+    invoice = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one_or_none()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="发票不存在")
+    _check_invoice_access(invoice, current_user)
+    if invoice.status != InvoiceStatus.CONFIRMED:
+        raise HTTPException(status_code=400, detail="该发票当前未锁定")
+    invoice.status = InvoiceStatus.REVIEWING
+    client_info = get_client_info(request)
+    await log_audit_no_commit(
+        db=db, entity_type="invoice", entity_id=invoice_id, action="unlock",
+        old_value={"status": InvoiceStatus.CONFIRMED.value},
+        new_value={"status": InvoiceStatus.REVIEWING.value},
+        ip_address=client_info.get("ip_address"), user_agent=client_info.get("user_agent"),
+    )
+    await db.commit()
+    return {"message": "已取消锁定，可编辑或重新解析"}
+
+
 @router.get("/export/csv")
 @limiter.limit("10/minute")
 async def export_invoices_csv(
@@ -1050,6 +1662,11 @@ async def export_invoices_csv(
     owner: Optional[str] = Query(None, description="归属人筛选"),
     start_date: Optional[str] = Query(None, description="开始日期"),
     end_date: Optional[str] = Query(None, description="结束日期"),
+    company_key: Optional[str] = Query(None, description="购买方公司分类"),
+    keyword: Optional[str] = Query(None, description="关键词（发票号/购买方/销售方）"),
+    party_type: Optional[str] = Query(None, pattern="^(company|person)$", description="购买方类型"),
+    buyer_keyword: Optional[str] = Query(None, description="购买方名称关键词"),
+    approval_number: Optional[str] = Query(None, description="审批编号"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1067,6 +1684,25 @@ async def export_invoices_csv(
         query = query.where(Invoice.status == status)
     if owner:
         query = query.where(Invoice.owner == owner)
+    if company_key is not None:
+        query = query.where(company_key_expression() == company_key)
+    buyer_tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    buyer_name = func.nullif(func.trim(Invoice.buyer_name), '')
+    if party_type == "company":
+        query = query.where(buyer_tax_id.is_not(None))
+    elif party_type == "person":
+        query = query.where(buyer_tax_id.is_(None), buyer_name.is_not(None))
+    if buyer_keyword:
+        query = query.where(Invoice.buyer_name.ilike(f"%{buyer_keyword}%"))
+    if approval_number:
+        query = query.where(Invoice.approval_instance_id == approval_number)
+    if keyword:
+        from sqlalchemy import or_
+        query = query.where(or_(
+            Invoice.invoice_number.ilike(f"%{keyword}%"),
+            Invoice.buyer_name.ilike(f"%{keyword}%"),
+            Invoice.seller_name.ilike(f"%{keyword}%"),
+        ))
     start_date_obj = _parse_date_param(start_date, "start_date")
     if start_date_obj:
         query = query.where(Invoice.issue_date >= start_date_obj)
@@ -1135,6 +1771,11 @@ async def export_invoices_excel(
     owner: Optional[str] = Query(None, description="归属人筛选"),
     start_date: Optional[str] = Query(None, description="开始日期"),
     end_date: Optional[str] = Query(None, description="结束日期"),
+    company_key: Optional[str] = Query(None, description="购买方公司分类"),
+    keyword: Optional[str] = Query(None, description="关键词（发票号/购买方/销售方）"),
+    party_type: Optional[str] = Query(None, pattern="^(company|person)$", description="购买方类型"),
+    buyer_keyword: Optional[str] = Query(None, description="购买方名称关键词"),
+    approval_number: Optional[str] = Query(None, description="审批编号"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1157,6 +1798,25 @@ async def export_invoices_excel(
         query = query.where(Invoice.status == status)
     if owner:
         query = query.where(Invoice.owner == owner)
+    if company_key is not None:
+        query = query.where(company_key_expression() == company_key)
+    buyer_tax_id = func.nullif(func.upper(func.trim(Invoice.buyer_tax_id)), '')
+    buyer_name = func.nullif(func.trim(Invoice.buyer_name), '')
+    if party_type == "company":
+        query = query.where(buyer_tax_id.is_not(None))
+    elif party_type == "person":
+        query = query.where(buyer_tax_id.is_(None), buyer_name.is_not(None))
+    if buyer_keyword:
+        query = query.where(Invoice.buyer_name.ilike(f"%{buyer_keyword}%"))
+    if approval_number:
+        query = query.where(Invoice.approval_instance_id == approval_number)
+    if keyword:
+        from sqlalchemy import or_
+        query = query.where(or_(
+            Invoice.invoice_number.ilike(f"%{keyword}%"),
+            Invoice.buyer_name.ilike(f"%{keyword}%"),
+            Invoice.seller_name.ilike(f"%{keyword}%"),
+        ))
     start_date_obj = _parse_date_param(start_date, "start_date")
     if start_date_obj:
         query = query.where(Invoice.issue_date >= start_date_obj)

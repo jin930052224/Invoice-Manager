@@ -29,6 +29,7 @@ export interface Invoice {
   tax_amount: number | null;
   status: InvoiceStatus;
   owner: string | null;
+  approval_instance_id: string | null;
   uploaded_by_id: number | null;
   uploaded_by_username: string | null;
   uploaded_by_display_name: string | null;

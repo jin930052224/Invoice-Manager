@@ -15,6 +15,8 @@ _llm_lock = threading.Lock()
 from app.services.prompts import (
     INVOICE_VISION_PROMPT,
     INVOICE_VISION_SYSTEM_PROMPT,
+    RAILWAY_TICKET_VISION_PROMPT,
+    RAILWAY_TICKET_VISION_SYSTEM_PROMPT,
     REQUIRED_FIELDS,
 )
 
@@ -117,7 +119,8 @@ class OpenAIProvider(BaseLLMProvider):
 
     # Models that support vision
     # Note: gpt-5 and o-series models also support vision/multimodal input
-    VISION_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview", "gpt-5", "o1", "o3"]
+    # The configured compatible gateway also exposes this verified vision alias.
+    VISION_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview", "gpt-5", "o1", "o3", "gemini-3.8-flash-high", "mf-deepseek-v4.1-flash"]
 
     def __init__(self):
         self._client = None
@@ -129,7 +132,9 @@ class OpenAIProvider(BaseLLMProvider):
             with self._lock:
                 if self._client is None:
                     from openai import OpenAI
-                    kwargs = {"api_key": settings.openai_api_key}
+                    # A stalled compatible-model request must not leave an
+                    # invoice permanently in “解析中”.
+                    kwargs = {"api_key": settings.openai_api_key, "timeout": 60.0}
                     if settings.openai_base_url:
                         kwargs["base_url"] = settings.openai_base_url
                         # Override User-Agent for custom base URLs to avoid
@@ -147,8 +152,8 @@ class OpenAIProvider(BaseLLMProvider):
     def supports_vision(self) -> bool:
         return _model_matches_vision_pattern(settings.openai_model, self.VISION_MODELS)
 
-    def chat_completion(self, system_prompt: str, user_prompt: str) -> str:
-        model = settings.openai_model
+    def chat_completion(self, system_prompt: str, user_prompt: str, model: Optional[str] = None) -> str:
+        model = model or settings.openai_model
         response = self.client.chat.completions.create(
             model=model,
             messages=[
@@ -160,8 +165,8 @@ class OpenAIProvider(BaseLLMProvider):
         )
         return response.choices[0].message.content.strip()
 
-    def vision_completion(self, system_prompt: str, user_prompt: str, image_data: bytes, mime_type: str = "image/png") -> str:
-        model = settings.openai_model
+    def vision_completion(self, system_prompt: str, user_prompt: str, image_data: bytes, mime_type: str = "image/png", model: Optional[str] = None) -> str:
+        model = model or settings.openai_model
         base64_image = base64.b64encode(image_data).decode("utf-8")
         response = self.client.chat.completions.create(
             model=model,
@@ -547,7 +552,12 @@ class LLMService:
         provider = self.active_provider
         return provider.supports_vision() if provider else False
 
-    def parse_invoice_from_image(self, image_data: bytes, mime_type: str = "image/png") -> Dict[str, Any]:
+    def parse_invoice_from_image(
+        self,
+        image_data: bytes,
+        mime_type: str = "image/png",
+        document_kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Parse invoice directly from image using vision capabilities.
 
         Args:
@@ -570,22 +580,77 @@ class LLMService:
             logger.warning(f"Provider {provider.get_provider_name()} does not support vision")
             return {}
 
-        try:
-            content = provider.vision_completion(
-                INVOICE_VISION_SYSTEM_PROMPT,
-                INVOICE_VISION_PROMPT,
-                image_data,
-                mime_type
-            )
+        is_railway_ticket = document_kind == "railway_ticket"
+        system_prompt = (
+            RAILWAY_TICKET_VISION_SYSTEM_PROMPT
+            if is_railway_ticket else INVOICE_VISION_SYSTEM_PROMPT
+        )
+        extraction_prompt = (
+            RAILWAY_TICKET_VISION_PROMPT
+            if is_railway_ticket else INVOICE_VISION_PROMPT
+        )
+        models = [None]
+        fallback = get_settings().openai_fallback_model.strip()
+        if isinstance(provider, OpenAIProvider) and fallback and fallback != get_settings().openai_model:
+            models.append(fallback)
+        best_fields: Dict[str, Any] = {}
+        for model in models:
+            label = model or get_settings().openai_model
+            try:
+                if model:
+                    content = provider.vision_completion(system_prompt, extraction_prompt, image_data, mime_type, model=model)
+                else:
+                    content = provider.vision_completion(system_prompt, extraction_prompt, image_data, mime_type)
+                fields = self._parse_json_response(content, provider.get_provider_name())
+                if all(fields.get(key) for key in ("invoice_number", "total_with_tax", "buyer_name", "seller_name")):
+                    return fields
+                if (bool(fields.get("invoice_number")), bool(fields.get("total_with_tax")), sum(value is not None for value in fields.values())) > (bool(best_fields.get("invoice_number")), bool(best_fields.get("total_with_tax")), sum(value is not None for value in best_fields.values())):
+                    best_fields = fields
+                logger.warning("Vision model %s returned incomplete invoice fields; trying fallback", label)
+            except Exception as e:
+                logger.error("LLM vision parsing failed (%s): %s", label, e)
+        return best_fields
 
-            return self._parse_json_response(content, provider.get_provider_name())
+    def parse_invoice_from_text(
+        self,
+        invoice_text: str,
+        document_kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract structured fields from a PDF's embedded text layer."""
+        if not self.is_available or not invoice_text.strip():
+            return {}
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM vision response as JSON: {e}")
+        provider = self.active_provider
+        if not provider:
             return {}
-        except Exception as e:
-            logger.error(f"LLM vision parsing failed ({provider.get_provider_name()}): {e}")
-            return {}
+
+        is_railway_ticket = document_kind == "railway_ticket"
+        extraction_prompt = RAILWAY_TICKET_VISION_PROMPT if is_railway_ticket else INVOICE_VISION_PROMPT
+        system_prompt = RAILWAY_TICKET_VISION_SYSTEM_PROMPT if is_railway_ticket else INVOICE_VISION_SYSTEM_PROMPT
+        prompt = (
+            extraction_prompt.replace("请按“铁路电子客票”模板分析这张电子发票（铁路电子客票）图片", "请按“铁路电子客票”模板分析以下文字")
+            .replace("请分析这张中国发票图片", "请分析下面的中国发票文字")
+            + "\n\n## 发票原始文字\n"
+            + invoice_text
+        )
+        models = [None]
+        fallback = get_settings().openai_fallback_model.strip()
+        if isinstance(provider, OpenAIProvider) and fallback and fallback != get_settings().openai_model:
+            models.append(fallback)
+        best_fields: Dict[str, Any] = {}
+        for model in models:
+            label = model or get_settings().openai_model
+            try:
+                content = provider.chat_completion(system_prompt, prompt, model=model) if model else provider.chat_completion(system_prompt, prompt)
+                fields = self._parse_json_response(content, provider.get_provider_name())
+                if all(fields.get(key) for key in ("invoice_number", "total_with_tax", "buyer_name", "seller_name")):
+                    return fields
+                if (bool(fields.get("invoice_number")), bool(fields.get("total_with_tax")), sum(value is not None for value in fields.values())) > (bool(best_fields.get("invoice_number")), bool(best_fields.get("total_with_tax")), sum(value is not None for value in best_fields.values())):
+                    best_fields = fields
+                logger.warning("Text model %s returned incomplete invoice fields; trying fallback", label)
+            except Exception as e:
+                logger.error("LLM text parsing failed (%s): %s", label, e)
+        return best_fields
 
     def _normalize_field_value(self, field_name: str, value: Any) -> Optional[str]:
         """Normalize and validate a single field value."""
@@ -659,6 +724,16 @@ class LLMService:
         fields: Dict[str, Optional[str]] = {}
         for field in REQUIRED_FIELDS:
             fields[field] = self._normalize_field_value(field, raw_fields.get(field))
+
+        # Models sometimes copy the seller tax ID into an individual buyer's
+        # empty tax-ID field. Distinct buyer/seller names cannot share one ID.
+        if (
+            fields.get("buyer_tax_id")
+            and fields.get("buyer_tax_id") == fields.get("seller_tax_id")
+            and fields.get("buyer_name") != fields.get("seller_name")
+        ):
+            logger.warning("Discarding buyer tax ID duplicated from seller")
+            fields["buyer_tax_id"] = None
 
         logger.info(f"LLM ({provider_name}) extracted fields: {list(fields.keys())}")
         return fields

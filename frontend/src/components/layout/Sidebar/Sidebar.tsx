@@ -26,7 +26,10 @@ interface SidebarProps {
 
 const navItems: NavItem[] = [
   { path: '/', label: '发票列表' },
-  { path: '/upload', label: '上传发票' },
+  { path: '/reviews', label: '待审核' },
+  { path: '/companies', label: '公司归类' },
+  { path: '/persons', label: '个人归类' },
+  { path: '/approvals', label: '审批编号归类' },
 ];
 
 export default function Sidebar({ llmConfigured, onOpenLLMConfig }: SidebarProps) {
@@ -88,7 +91,7 @@ export default function Sidebar({ llmConfigured, onOpenLLMConfig }: SidebarProps
         {/* Logo */}
         <div className={styles.logo}>
           <div className={styles.logoMark} />
-          <span className={styles.logoText}>发票管理</span>
+          <span className={styles.logoText}>库次发票管理</span>
         </div>
 
         {/* Navigation */}

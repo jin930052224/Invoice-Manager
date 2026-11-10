@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Upload, message, List, Tag, Radio, Tooltip } from 'antd';
+import { Upload, message, List, Tag, Radio, Tooltip, Input, Button } from 'antd';
 import { UploadOutlined, CheckCircleOutlined, CloseCircleOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
-import { uploadInvoices, getLLMStatus } from '../services/api';
+import { uploadInvoices, getLLMStatus, startDingTalkApprovalNumberImport, getDingTalkApprovalImportStatus } from '../services/api';
 import type { UploadResponse, LLMStatusResponse } from '../types/invoice';
 import styles from './UploadPage.module.css';
 
@@ -13,7 +13,7 @@ function UploadPage() {
   const navigate = useNavigate();
   const [fileList, setFileList] = useState<UploadFile[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [processingMode, setProcessingMode] = useState<string>('ocr_only');
+  const [processingMode, setProcessingMode] = useState<string>('llm_only');
   const [llmStatus, setLlmStatus] = useState<LLMStatusResponse | null>(null);
 
   useEffect(() => {
@@ -21,6 +21,27 @@ function UploadPage() {
   }, []);
   const [results, setResults] = useState<UploadResponse[]>([]);
   const [countdown, setCountdown] = useState<number | null>(null);
+  const [approvalNumber, setApprovalNumber] = useState('');
+  const [approvalImport, setApprovalImport] = useState<any>(null);
+  const [approvalImporting, setApprovalImporting] = useState(false);
+
+  useEffect(() => {
+    if (!approvalImport || ['completed', 'completed_with_errors', 'failed', 'rejected', 'idle'].includes(approvalImport.status)) return;
+    const timer = window.setInterval(() => getDingTalkApprovalImportStatus().then(setApprovalImport).catch(() => {}), 2000);
+    return () => window.clearInterval(timer);
+  }, [approvalImport]);
+
+  const handleApprovalImport = async () => {
+    if (!approvalNumber.trim()) { message.warning('请输入审批编号'); return; }
+    setApprovalImporting(true);
+    try {
+      const job = await startDingTalkApprovalNumberImport(approvalNumber.trim());
+      setApprovalImport(job);
+      message.success('审批附件导入已启动');
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '审批附件导入失败');
+    } finally { setApprovalImporting(false); }
+  };
 
   // Auto-navigate to list after successful upload
   useEffect(() => {
@@ -47,7 +68,7 @@ function UploadPage() {
 
       const successCount = response.filter((r) => r.status === 'success').length;
       if (successCount > 0) {
-        message.success(`成功上传 ${successCount} 个文件`);
+        message.success(`成功上传 ${successCount} 个文件，正在识别发票`);
         setFileList([]);
         setCountdown(5); // auto navigate in 5s
       }
@@ -118,6 +139,12 @@ function UploadPage() {
                 <Radio.Button value="llm_only">仅 LLM 视觉（高精度）</Radio.Button>
               </Tooltip>
             </Radio.Group>
+          </div>
+          <div className={styles.modeSelector}>
+            <span className={styles.modeSelectorLabel}>按审批编号导入</span>
+            <Input value={approvalNumber} onChange={(event) => setApprovalNumber(event.target.value)} placeholder="输入钉钉审批编号" style={{ width: 300 }} />
+            <Button onClick={handleApprovalImport} loading={approvalImporting}>导入附件并解析</Button>
+            {approvalImport && <span style={{ color: approvalImport.failed ? '#cf1322' : '#666' }}>状态：{approvalImport.failed ? '部分附件导入失败' : approvalImport.status} · 附件 {approvalImport.total} · 已导入 {approvalImport.invoices} · 跳过 {approvalImport.skipped} · 失败 {approvalImport.failed}</span>}
           </div>
           <div className={styles.uploadDropzone}>
             <Dragger {...uploadProps}>

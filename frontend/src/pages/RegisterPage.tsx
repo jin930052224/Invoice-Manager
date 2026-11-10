@@ -39,7 +39,7 @@ export default function RegisterPage() {
         <div className={styles.header}>
           <div className={styles.logoRow}>
             <div className={styles.logoMark} />
-            <span className={styles.logoText}>发票管理</span>
+            <span className={styles.logoText}>库次发票管理</span>
           </div>
           <h1 className={styles.title}>创建账号</h1>
           <p className={styles.subtitle}>填写信息以完成注册</p>

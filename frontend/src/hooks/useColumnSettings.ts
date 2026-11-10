@@ -10,6 +10,7 @@ interface ColumnSettings {
 
 const defaultColumnConfigs: ColumnConfig[] = [
   { key: 'invoice_number', title: '发票号码', visible: true },
+  { key: 'approval_instance_id', title: '审批编号', visible: true },
   { key: 'issue_date', title: '开票日期', visible: true },
   { key: 'buyer_name', title: '购买方', visible: true },
   { key: 'buyer_tax_id', title: '购买方税号', visible: false },
@@ -35,6 +36,7 @@ const defaultColumnConfigs: ColumnConfig[] = [
 
 const defaultColumnWidths: Record<string, number> = {
   invoice_number: 150,
+  approval_instance_id: 230,
   issue_date: 120,
   buyer_name: 180,
   buyer_tax_id: 180,

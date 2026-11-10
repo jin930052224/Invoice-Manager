@@ -40,6 +40,9 @@ class InvoiceCreate(InvoiceBase):
 class InvoiceUpdate(InvoiceBase):
     status: Optional[InvoiceStatus] = None
     owner: Optional[str] = None
+    approval_instance_id: Optional[str] = None
+    approval_claim_amount: Optional[Decimal] = None
+    document_type: str = "invoice"
 
 
 class InvoiceResponse(InvoiceBase):
@@ -48,6 +51,9 @@ class InvoiceResponse(InvoiceBase):
     file_type: str
     status: InvoiceStatus
     owner: Optional[str] = None
+    approval_instance_id: Optional[str] = None
+    approval_claim_amount: Optional[Decimal] = None
+    document_type: str = "invoice"
     uploaded_by_id: Optional[int] = None
     uploaded_by_username: Optional[str] = None
     uploaded_by_display_name: Optional[str] = None
@@ -166,7 +172,7 @@ class ResolveDiffRequest(BaseModel):
 
 class DuplicateGroup(BaseModel):
     """A group of invoices detected as duplicates."""
-    reason: str = Field(description="重复原因，如'发票号码相同'或'关键字段完全一致'")
+    reason: str = Field(description="重复原因，固定为'发票号码相同'")
     duplicate_key: str = Field(description="重复依据的字段值")
     invoices: List[InvoiceResponse]
 

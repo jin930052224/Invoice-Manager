@@ -11,6 +11,7 @@ import {
   Input,
   Select,
   Modal,
+  Space,
 } from 'antd';
 import {
   ArrowLeftOutlined,
@@ -24,7 +25,7 @@ import {
   DownloadOutlined,
   ExpandOutlined,
 } from '@ant-design/icons';
-import { getInvoice, fetchInvoiceFileBlob, downloadBlobUrl, updateInvoice, resolveDiff, confirmInvoice, reprocessInvoice, getAdjacentInvoices } from '../services/api';
+import { getInvoice, fetchInvoiceFileBlob, downloadBlobUrl, updateInvoice, resolveDiff, confirmInvoice, unlockInvoice, reprocessInvoice, getAdjacentInvoices, archiveInvoiceAsVoucher } from '../services/api';
 import type { InvoiceDetail } from '../types/invoice';
 import { InvoiceStatus } from '../types/invoice';
 import StatusTag from '../components/StatusTag';
@@ -40,7 +41,7 @@ const fieldLabels: Record<string, string> = {
   seller_tax_id: '销售方纳税人识别号',
   item_name: '项目名称',
   total_with_tax: '价税合计',
-  specification: '规格型号',
+  specification: '规格型号 / 行程信息',
   unit: '单位',
   quantity: '数量',
   unit_price: '单价',
@@ -54,7 +55,10 @@ function InvoiceDetailPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user: currentUser } = useAuth();
-  const idList: number[] = (location.state as { ids?: number[] } | null)?.ids ?? [];
+  const locationState = location.state as { ids?: number[]; returnTo?: string; returnLabel?: string } | null;
+  const idList: number[] = locationState?.ids ?? [];
+  const returnTo = locationState?.returnTo?.startsWith('/') ? locationState.returnTo : '/';
+  const returnLabel = locationState?.returnLabel || '返回列表';
   const currentIndex = idList.indexOf(Number(id));
   const prevIdFromList = currentIndex > 0 ? idList[currentIndex - 1] : null;
   const nextIdFromList = currentIndex >= 0 && currentIndex < idList.length - 1 ? idList[currentIndex + 1] : null;
@@ -81,6 +85,7 @@ function InvoiceDetailPage() {
   const [isDragging, setIsDragging] = useState(false);
   const [fullscreenPreview, setFullscreenPreview] = useState(false);
   const [fileBlob, setFileBlob] = useState<{ url: string; filename: string } | null>(null);
+  const isRailwayTicket = Boolean(invoice?.item_name?.startsWith('铁路'));
   const dragStartX = useRef(0);
   const dragStartWidth = useRef(420);
 
@@ -241,11 +246,42 @@ function InvoiceDetailPage() {
       await reprocessInvoice(parseInt(id));
       message.success('重新解析完成');
       await fetchInvoice();
-    } catch (error) {
-      message.error('重新解析失败');
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '重新解析失败，原有数据已保留');
     } finally {
       setReprocessing(false);
     }
+  };
+
+  const handleUnlock = () => {
+    if (!id) return;
+    Modal.confirm({
+      title: '取消锁定发票',
+      content: '取消锁定后可编辑发票内容或重新解析。',
+      okText: '取消锁定',
+      cancelText: '保留锁定',
+      onOk: async () => {
+        await unlockInvoice(parseInt(id));
+        message.success('已取消锁定');
+        await fetchInvoice();
+      },
+    });
+  };
+
+  const handleArchiveAsVoucher = () => {
+    if (!id) return;
+    Modal.confirm({
+      title: '标记为不是发票？',
+      content: '文件会保留在凭证归档中，但会从发票列表和待审核列表移除。',
+      okText: '归档到凭证',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        await archiveInvoiceAsVoucher(parseInt(id));
+        message.success('已归档到凭证备份');
+        navigate(returnTo);
+      },
+    });
   };
 
   const handleCustomValueSubmit = async () => {
@@ -281,15 +317,15 @@ function InvoiceDetailPage() {
       {/* Page Header */}
       <div className={styles.pageHeader}>
         <div className={styles.headerLeft}>
-          <button className={styles.backButton} onClick={() => navigate('/')}>
+          <button className={styles.backButton} onClick={() => navigate(returnTo)}>
             <ArrowLeftOutlined />
-            返回列表
+            {returnLabel}
           </button>
           <Button.Group size="small" style={{ marginLeft: 8 }}>
               <Button
                 icon={<LeftOutlined />}
                 disabled={prevId === null}
-                onClick={() => prevId !== null && navigate(`/invoices/${prevId}`, { state: { ids: idList } })}
+                onClick={() => prevId !== null && navigate(`/invoices/${prevId}`, { state: locationState })}
               >
                 上一张
               </Button>
@@ -297,14 +333,14 @@ function InvoiceDetailPage() {
                 iconPosition="end"
                 icon={<RightOutlined />}
                 disabled={nextId === null}
-                onClick={() => nextId !== null && navigate(`/invoices/${nextId}`, { state: { ids: idList } })}
+                onClick={() => nextId !== null && navigate(`/invoices/${nextId}`, { state: locationState })}
               >
                 下一张
               </Button>
             </Button.Group>
           <div className={styles.headerTitle}>
             <div className={styles.invoiceNumber}>
-              {invoice.invoice_number || '发票详情'}
+              {invoice.approval_instance_id || invoice.invoice_number || '发票详情'}
             </div>
             <div className={styles.invoiceMetadata}>
               开票日期: {invoice.issue_date || '-'} • 归属: {invoice.owner || '-'}
@@ -312,9 +348,16 @@ function InvoiceDetailPage() {
           </div>
         </div>
         <div className={styles.headerActions}>
-          <button className={styles.confirmButton} onClick={handleConfirmAll}>
-            确认发票
-          </button>
+          {invoice.status === InvoiceStatus.CONFIRMED ? (
+            <Button onClick={handleUnlock}>取消锁定</Button>
+          ) : (
+            <Space>
+              <button className={styles.confirmButton} onClick={handleConfirmAll}>确认发票</button>
+              {invoice.status === InvoiceStatus.REVIEWING && (
+                <Button danger onClick={handleArchiveAsVoucher}>不是发票</Button>
+              )}
+            </Space>
+          )}
         </div>
       </div>
 
@@ -326,7 +369,7 @@ function InvoiceDetailPage() {
           <div className={styles.card}>
             <div className={styles.cardHeader}>
               <div className={styles.cardTitle}>
-                发票信息
+                {isRailwayTicket ? '铁路电子客票信息' : '发票信息'}
                 <StatusTag status={invoice.status === '已确认' ? 'success' : 'processing'}>
                   {invoice.status}
                 </StatusTag>
@@ -339,7 +382,7 @@ function InvoiceDetailPage() {
                       保存
                     </Button>
                   </>
-                ) : (
+                ) : invoice.status !== InvoiceStatus.CONFIRMED && (
                   <Button icon={<EditOutlined />} onClick={() => setEditMode(true)}>
                     编辑
                   </Button>
@@ -385,6 +428,11 @@ function InvoiceDetailPage() {
                         <Input />
                       </Form.Item>
                     </Col>
+                    <Col span={24}>
+                      <Form.Item name="specification" label={isRailwayTicket ? '行程信息' : '规格型号'}>
+                        <Input />
+                      </Form.Item>
+                    </Col>
                     <Col span={8}>
                       <Form.Item name="total_with_tax" label="价税合计" required>
                         <Input type="number" />
@@ -422,6 +470,9 @@ function InvoiceDetailPage() {
                   <Descriptions.Item label={<><span style={{color:'#ff4d4f',marginRight:2}}>*</span>发票号码</>}>
                     {invoice.invoice_number || '-'}
                   </Descriptions.Item>
+                  <Descriptions.Item label="审批编号">
+                    {invoice.approval_instance_id || '-'}
+                  </Descriptions.Item>
                   <Descriptions.Item label={<><span style={{color:'#ff4d4f',marginRight:2}}>*</span>开票日期</>}>
                     {invoice.issue_date || '-'}
                   </Descriptions.Item>
@@ -440,7 +491,7 @@ function InvoiceDetailPage() {
                   <Descriptions.Item label="项目名称" span={2}>
                     {invoice.item_name || '-'}
                   </Descriptions.Item>
-                  <Descriptions.Item label="规格型号">
+                  <Descriptions.Item label={isRailwayTicket ? '行程信息' : '规格型号'} span={isRailwayTicket ? 2 : 1}>
                     {invoice.specification || '-'}
                   </Descriptions.Item>
                   <Descriptions.Item label="单位">
@@ -503,6 +554,7 @@ function InvoiceDetailPage() {
                   icon={<SyncOutlined spin={reprocessing} />}
                   onClick={handleReprocess}
                   loading={reprocessing}
+                  disabled={invoice.status === InvoiceStatus.CONFIRMED}
                   size="small"
                 >
                   重新解析
@@ -558,7 +610,7 @@ function InvoiceDetailPage() {
                             </div>
                           </td>
                           <td>
-                            {!diff.resolved && !isMatch && (
+                            {invoice.status !== InvoiceStatus.CONFIRMED && !diff.resolved && !isMatch && (
                               <div style={{ display: 'flex', gap: '8px' }}>
                                 <Button
                                   type="link"
@@ -591,7 +643,7 @@ function InvoiceDetailPage() {
                             {diff.resolved && (
                               <StatusTag status="success">已解决</StatusTag>
                             )}
-                            {isMatch && !diff.resolved && (
+                            {invoice.status !== InvoiceStatus.CONFIRMED && isMatch && !diff.resolved && (
                               <Button
                                 type="link"
                                 size="small"
@@ -693,7 +745,7 @@ function InvoiceDetailPage() {
           width="92vw"
           style={{ top: 20 }}
           styles={{ body: { padding: 0, height: 'calc(90vh - 55px)' } }}
-          title={invoice.filename || '文件预览'}
+          title={invoice.file_name || '文件预览'}
         >
           {invoice.file_type === 'pdf' ? (
             <iframe

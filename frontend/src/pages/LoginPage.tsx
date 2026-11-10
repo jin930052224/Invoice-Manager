@@ -31,7 +31,7 @@ export default function LoginPage() {
         <div className={styles.header}>
           <div className={styles.logoRow}>
             <div className={styles.logoMark} />
-            <span className={styles.logoText}>发票管理</span>
+            <span className={styles.logoText}>库次发票管理</span>
           </div>
           <h1 className={styles.title}>欢迎回来</h1>
           <p className={styles.subtitle}>请登录您的账号以继续</p>

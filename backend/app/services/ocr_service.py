@@ -23,6 +23,12 @@ class OCRService:
     def __init__(self):
         self._ocr = None
         self._init_lock = threading.Lock()
+        # PaddleOCR's native predictor is not safe for concurrent ``ocr()``
+        # calls.  In particular, simultaneous calls can abort the whole
+        # Python process rather than raising an exception.  Keep all native
+        # inference in one lane; the web server and LLM requests remain
+        # concurrent.
+        self._inference_lock = threading.RLock()
 
     @property
     def ocr(self):
@@ -89,6 +95,11 @@ class OCRService:
 
         return text_lines, confidences, line_items
 
+    def _run_inference(self, image_array):
+        """Run a single Paddle predictor call without concurrent access."""
+        with self._inference_lock:
+            return self.ocr.ocr(image_array, cls=True)
+
     def _sort_lines_by_position(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sort OCR lines by approximate reading order (top-to-bottom, left-to-right)."""
         if not lines:
@@ -109,7 +120,7 @@ class OCRService:
             image_array = np.array(image)
 
             # PaddleOCR v2.x uses ocr() method
-            result = self.ocr.ocr(image_array, cls=True)
+            result = self._run_inference(image_array)
             if result and result[0]:
                 result = result[0]
 
@@ -218,7 +229,7 @@ class OCRService:
                 image_array = np.array(image)
 
                 # PaddleOCR v2.x uses ocr() method
-                result = self.ocr.ocr(image_array, cls=True)
+                result = self._run_inference(image_array)
                 if result and result[0]:
                     result = result[0]
 
@@ -258,6 +269,10 @@ class FieldExtractor:
         # Format is typically *类别*商品名称, we want to capture "类别*商品名称"
         # Example: *家具*办公椅 → captures "家具*办公椅"
         'item_name': r'\*([^*\n]+(?:\*[^*\n]+)*)',
+        'specification': r'(?:规格型号|规格)\s*[：:]?\s*([^\n]+)',
+        'unit': r'(?:单位)\s*[：:]?\s*([^\n\s]+)',
+        'quantity': r'(?:数量)\s*[：:]?\s*(\d+(?:\.\d+)?)',
+        'unit_price': r'(?:单价)\s*[：:]?\s*([\d,.]+)',
         'total_with_tax': r'(?:小写|价税合计)[）)（(]*\s*[¥￥]\s*([\d,.]+)',
         'amount': r'(?:合\s*计|金\s*额)\s*[¥￥]?\s*([\d,.]+)',
         'tax_amount': r'(?:税\s*额\s*[¥￥]?\s*([\d,.]+)|[¥￥]\s*[\d,.]+\s*[¥￥]\s*([\d,.]+))',
@@ -747,6 +762,18 @@ class FieldExtractor:
             except Exception as e:
                 logger.warning(f"Failed to extract {field_name}: {e}")
                 fields[field_name] = None
+
+        # OCR frequently returns the detail-table header as a value and may
+        # append all columns to a starred item name. Remove those artifacts.
+        header_words = ('项目名称', '规格型号', '单位', '数量', '单价', '金额', '税率', '税额')
+        specification = fields.get('specification')
+        if specification and any(word in specification for word in header_words):
+            fields['specification'] = None
+        item_name = fields.get('item_name')
+        if item_name and item_name.startswith('*'):
+            match = re.match(r'(\*[^*\n]+(?:\*[^*\n]+)?)', item_name)
+            if match:
+                fields['item_name'] = match.group(1).strip()
 
         # For Chinese invoices, use position-based extraction for buyer/seller
         if is_chinese:

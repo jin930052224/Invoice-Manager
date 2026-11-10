@@ -54,7 +54,7 @@ export default function MainLayout({
         </div>
 
         <footer className={styles.footer}>
-          发票管理系统 ©2025 by Stometaverse.
+          库次发票管理 ©2025 by Stometaverse.
         </footer>
       </main>
     </div>
